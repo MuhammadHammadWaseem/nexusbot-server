@@ -101,7 +101,11 @@ app.post('/api/bot/trade/close', requireBotToken, async (req, res) => {
   }).eq('id', trade_id).eq('bot_id', bot.id);
 
   if (tradeErr) return res.status(500).json({ success: false, error: tradeErr.message });
-  await supabase.rpc('update_bot_stats_on_close', { p_bot_id: bot.id, p_pnl: pnl_usdt || 0, p_is_win: (pnl_usdt || 0) > 0 });
+  // Use net_pnl (after fees) for stats — gross PnL is misleading since
+  // a trade can be gross-positive but net-negative after fees.
+  const effectivePnl = (net_pnl !== undefined && net_pnl !== null) ? net_pnl : (pnl_usdt || 0);
+  const isWin = effectivePnl > 0;
+  await supabase.rpc('update_bot_stats_on_close', { p_bot_id: bot.id, p_pnl: effectivePnl, p_is_win: isWin });
   res.json({ success: true });
 });
 
