@@ -483,6 +483,100 @@ app.post('/api/admin/subscriptions/grant', requireUser, requireAdmin, async (req
   res.json({ success: true, subscription: sub });
 });
 
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OPEN TRADE UNREALISED PNL
+// Reads the most recent [WATCHING] log for each open trade to extract live PnL.
+// The Python bot logs "[WATCHING] SYMBOL ... PnL=+0.1234 ..." every cycle.
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.get('/api/user/open-pnl', requireUser, async (req, res) => {
+  // 1. Get all open trades for this user
+  const { data: openTrades } = await supabase
+    .from('trades')
+    .select('id, bot_id, trading_pair, trade_type, entry_price, quantity, leverage, tp_price, sl_price, opened_at')
+    .eq('user_id', req.user.id)
+    .eq('status', 'open');
+
+  if (!openTrades || openTrades.length === 0) {
+    return res.json({ trades: [] });
+  }
+
+  // 2. For each open trade, find most recent WATCHING log from that bot
+  const enriched = await Promise.all(openTrades.map(async (trade) => {
+    const { data: logs } = await supabase
+      .from('bot_logs')
+      .select('message, logged_at')
+      .eq('bot_id', trade.bot_id)
+      .ilike('message', `%[WATCHING] ${trade.trading_pair}%`)
+      .order('logged_at', { ascending: false })
+      .limit(1);
+
+    let unrealized_pnl = 0;
+    let current_price  = null;
+    let pnl_r          = null;
+
+    if (logs && logs.length > 0) {
+      const msg = logs[0].message;
+      // Parse: PnL=+0.1234
+      const pnlMatch = msg.match(/PnL=([+-]?\d+\.\d+)/);
+      if (pnlMatch) unrealized_pnl = parseFloat(pnlMatch[1]);
+      // Parse: now=84.1100
+      const nowMatch = msg.match(/now=([\d.]+)/);
+      if (nowMatch) current_price = parseFloat(nowMatch[1]);
+      // Parse: R=+0.54
+      const rMatch = msg.match(/R=([+-]?[\d.]+)/);
+      if (rMatch) pnl_r = parseFloat(rMatch[1]);
+    }
+
+    return {
+      ...trade,
+      unrealized_pnl,
+      current_price,
+      pnl_r,
+    };
+  }));
+
+  res.json({ trades: enriched });
+});
+
+// GET /api/bots/:id/detail — full bot detail for the detail page
+app.get('/api/bots/:id/detail', requireUser, async (req, res) => {
+  const { id: botId } = req.params;
+
+  const [botRes, tradesRes, signalsRes, closedCountRes, openCountRes] = await Promise.all([
+    supabase.from('bots').select('*').eq('id', botId).eq('user_id', req.user.id).single(),
+    // No limit — fetch ALL trades so counts are exact and pagination issues are ruled out
+    supabase.from('trades').select('*').eq('bot_id', botId).eq('user_id', req.user.id)
+      .order('opened_at', { ascending: false }),
+    // More signals for a richer chart baseline (up to 200 = ~3h of 5m bars)
+    supabase.from('signals').select('price_at_signal, signaled_at, signal, confidence, regime, action_taken')
+      .eq('bot_id', botId).order('signaled_at', { ascending: false }).limit(200),
+    // Authoritative closed trade count direct from trades table
+    supabase.from('trades').select('id', { count: 'exact', head: true })
+      .eq('bot_id', botId).eq('user_id', req.user.id).eq('status', 'closed'),
+    // Open trade count
+    supabase.from('trades').select('id', { count: 'exact', head: true })
+      .eq('bot_id', botId).eq('user_id', req.user.id).eq('status', 'open'),
+  ]);
+
+  if (!botRes.data) return res.status(404).json({ error: 'Bot not found' });
+
+  const closedCount = closedCountRes.count ?? 0;
+  const openCount   = openCountRes.count   ?? 0;
+
+  res.json({
+    bot:          botRes.data,
+    trades:       tradesRes.data || [],
+    signals:      (signalsRes.data || []).reverse(), // chronological for chart
+    // Ground-truth counts from trades table (bot.total_trades can lag if
+    // a trade was inserted without going through update_bot_stats_on_close)
+    closed_count: closedCount,
+    open_count:   openCount,
+    total_count:  closedCount + openCount,
+  });
+});
+
 app.get('/health', (_req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
 app.listen(PORT, () => console.log(`NexusBot API server on http://127.0.0.1:${PORT}`));
