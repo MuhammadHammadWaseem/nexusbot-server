@@ -577,6 +577,283 @@ app.get('/api/bots/:id/detail', requireUser, async (req, res) => {
   });
 });
 
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BOT EDIT (PUT /api/bots/:id)
+// Updates editable bot fields. Cannot change trading_pair while running.
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.put('/api/bots/:id', requireUser, async (req, res) => {
+  const { id: botId } = req.params;
+  const { data: bot, error } = await supabase.from('bots').select('*')
+    .eq('id', botId).eq('user_id', req.user.id).single();
+  if (error || !bot) return res.status(404).json({ error: 'Bot not found' });
+
+  const {
+    bot_name, leverage, min_confidence,
+    stop_loss_percent, take_profit_percent,
+    trade_amount, trade_amount_type,
+    daily_max_loss, max_open_trades, max_trades_per_day,
+  } = req.body;
+
+  // Build update payload — only include fields that were sent
+  const patch = {};
+  if (bot_name            !== undefined) patch.bot_name            = bot_name;
+  if (leverage            !== undefined) patch.leverage            = Number(leverage);
+  if (min_confidence      !== undefined) patch.min_confidence      = Number(min_confidence);
+  if (stop_loss_percent   !== undefined) patch.stop_loss_percent   = Number(stop_loss_percent);
+  if (take_profit_percent !== undefined) patch.take_profit_percent = Number(take_profit_percent);
+  if (trade_amount        !== undefined) patch.trade_amount        = Number(trade_amount);
+  if (trade_amount_type   !== undefined) patch.trade_amount_type   = trade_amount_type;
+  if (daily_max_loss      !== undefined) patch.daily_max_loss      = Number(daily_max_loss);
+  if (max_open_trades     !== undefined) patch.max_open_trades     = Number(max_open_trades);
+  if (max_trades_per_day  !== undefined) patch.max_trades_per_day  = Number(max_trades_per_day);
+  patch.updated_at = new Date().toISOString();
+
+  const { data: updated, error: upErr } = await supabase.from('bots')
+    .update(patch).eq('id', botId).select().single();
+  if (upErr) return res.status(500).json({ error: upErr.message });
+
+  res.json({ success: true, bot: updated });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WALLET BALANCE (GET /api/user/balance)
+// Fetches USDT balance directly from Binance testnet using the user's
+// first connected exchange. No bot needs to be running.
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.get('/api/user/balance', requireUser, async (req, res) => {
+  // Get the first connected exchange for this user
+  const { data: conn } = await supabase
+    .from('exchange_connections')
+    .select('api_key, api_secret')
+    .eq('user_id', req.user.id)
+    .eq('is_connected', true)
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (!conn || !conn.api_key) {
+    // No exchange connected — return zeros gracefully
+    return res.json({ total_balance: 0, available_balance: 0, unrealized_pnl: 0, connected: false });
+  }
+
+  try {
+    const ts    = Date.now();
+    const query = `timestamp=${ts}`;
+    const sig   = crypto.createHmac('sha256', conn.api_secret).update(query).digest('hex');
+    const url   = `https://testnet.binancefuture.com/fapi/v2/balance?${query}&signature=${sig}`;
+
+    const response = await fetch(url, {
+      headers: { 'X-MBX-APIKEY': conn.api_key },
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      return res.json({ total_balance: 0, available_balance: 0, unrealized_pnl: 0,
+                        connected: false, error: err.msg || 'Exchange error' });
+    }
+
+    const data = await response.json();   // array of asset balances
+    const usdt = Array.isArray(data)
+      ? data.find(b => b.asset === 'USDT')
+      : null;
+
+    if (!usdt) {
+      return res.json({ total_balance: 0, available_balance: 0, unrealized_pnl: 0, connected: true });
+    }
+
+    res.json({
+      total_balance:     parseFloat(usdt.balance          || 0),
+      available_balance: parseFloat(usdt.availableBalance || 0),
+      unrealized_pnl:    parseFloat(usdt.crossUnPnl       || 0),
+      connected:         true,
+    });
+  } catch (e) {
+    console.error('[balance]', e.message);
+    res.json({ total_balance: 0, available_balance: 0, unrealized_pnl: 0,
+               connected: false, error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EXCHANGE SYNC (POST /api/user/sync-trades)
+//
+// Reconciles DB open trades against live exchange positions.
+// Called by the frontend "Sync" button on Bots page, and automatically
+// by the bot on startup via the heartbeat response.
+//
+// Algorithm:
+//   1. Load all DB trades with status='open' for this user's bots
+//   2. For each unique trading_pair, fetch open positions from Binance
+//   3. If a DB trade has no matching exchange position → close it as PHANTOM
+//      (the exchange closed it via TP/SL/liquidation without the bot recording it)
+//   4. Return a summary of what was fixed
+//
+// Design notes:
+//   - Uses the user's first connected exchange (same as /api/user/balance)
+//   - Bot-authenticated version is POST /api/bot/sync — called on bot startup
+//   - Does NOT open new positions — only closes ghost ones
+//   - Safe to call multiple times (idempotent)
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function syncTradesForUser(userId, apiKey, apiSecret) {
+  // 1. Get all open trades for this user
+  const { data: openTrades } = await supabase
+    .from('trades')
+    .select('id, bot_id, trading_pair, trade_type, entry_price, tp_price, sl_price, opened_at')
+    .eq('user_id', userId)
+    .eq('status', 'open');
+
+  if (!openTrades || openTrades.length === 0) {
+    return { synced: 0, closed_phantom: 0, message: 'No open trades to sync' };
+  }
+
+  // 2. Fetch all open positions from exchange (one call, all symbols)
+  const ts    = Date.now();
+  const query = `timestamp=${ts}`;
+  const sig   = crypto.createHmac('sha256', apiSecret).update(query).digest('hex');
+  const url   = `https://testnet.binancefuture.com/fapi/v2/positionRisk?${query}&signature=${sig}`;
+
+  let exchangePositions = [];
+  try {
+    const resp = await fetch(url, {
+      headers: { 'X-MBX-APIKEY': apiKey },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (resp.ok) {
+      const all = await resp.json();
+      // Only positions with non-zero size
+      exchangePositions = Array.isArray(all)
+        ? all.filter(p => Math.abs(parseFloat(p.positionAmt || 0)) > 0)
+        : [];
+    }
+  } catch (e) {
+    console.error('[sync] Exchange fetch failed:', e.message);
+    return { synced: 0, closed_phantom: 0, error: e.message };
+  }
+
+  // Build lookup: symbol → positionAmt (positive=long, negative=short)
+  const exchangeMap = {};
+  for (const p of exchangePositions) {
+    const sym = p.symbol.toUpperCase();
+    exchangeMap[sym] = parseFloat(p.positionAmt || 0);
+    if (!exchangeMap[sym + '_price']) {
+      exchangeMap[sym + '_price']    = parseFloat(p.markPrice || 0);
+      exchangeMap[sym + '_unrealised'] = parseFloat(p.unRealizedProfit || 0);
+    }
+  }
+
+  // 3. Close phantom trades
+  let closed_phantom = 0;
+  const now = new Date().toISOString();
+
+  for (const trade of openTrades) {
+    const sym     = trade.trading_pair.toUpperCase();
+    const botSide = trade.trade_type;          // 'long' or 'short'
+    const exchAmt = exchangeMap[sym] ?? null;  // null = symbol not in exchange response at all
+
+    // A trade is phantom if:
+    //   a) The exchange has NO position at all for this symbol, OR
+    //   b) The exchange position direction is opposite (can't happen normally but guards edge cases)
+    const exchangeHasNoPosition = exchAmt === null || exchAmt === 0;
+    const directionMismatch = exchAmt !== null && exchAmt !== 0 &&
+      ((botSide === 'long' && exchAmt < 0) || (botSide === 'short' && exchAmt > 0));
+
+    if (exchangeHasNoPosition || directionMismatch) {
+      // Infer exit reason from price vs SL/TP
+      const markPrice  = exchangeMap[sym + '_price'] || 0;
+      const unrealised = exchangeMap[sym + '_unrealised'] || 0;
+
+      let exit_reason = 'SYNC_CLOSED';
+      if (trade.sl_price && trade.tp_price && markPrice > 0) {
+        if (botSide === 'long') {
+          if (markPrice <= parseFloat(trade.sl_price))       exit_reason = 'SL_EXTERNAL';
+          else if (markPrice >= parseFloat(trade.tp_price))  exit_reason = 'TP_EXTERNAL';
+        } else {
+          if (markPrice >= parseFloat(trade.sl_price))       exit_reason = 'SL_EXTERNAL';
+          else if (markPrice <= parseFloat(trade.tp_price))  exit_reason = 'TP_EXTERNAL';
+        }
+      }
+
+      const { error: closeErr } = await supabase.from('trades').update({
+        status:      'closed',
+        exit_price:  markPrice || null,
+        profit_loss: unrealised,
+        net_pnl:     unrealised,
+        exit_reason,
+        closed_at:   now,
+        bars_held:   null,
+      }).eq('id', trade.id);
+
+      if (!closeErr) {
+        // Update bot stats for this phantom close
+        const isWin = unrealised > 0;
+        await supabase.rpc('update_bot_stats_on_close', {
+          p_bot_id: trade.bot_id,
+          p_pnl:    unrealised,
+          p_is_win: isWin,
+        });
+        closed_phantom++;
+        console.log(`[SYNC] Closed phantom trade ${trade.id} (${sym} ${botSide}) reason=${exit_reason}`);
+      }
+    }
+  }
+
+  return {
+    synced: openTrades.length,
+    closed_phantom,
+    message: closed_phantom > 0
+      ? `Closed ${closed_phantom} phantom trade(s) that were no longer on the exchange`
+      : 'All open trades verified on exchange — no phantoms found',
+  };
+}
+
+// User-facing sync (called from Bots page "Sync" button)
+app.post('/api/user/sync-trades', requireUser, async (req, res) => {
+  const { data: conn } = await supabase
+    .from('exchange_connections')
+    .select('api_key, api_secret')
+    .eq('user_id', req.user.id)
+    .eq('is_connected', true)
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (!conn?.api_key) {
+    return res.status(400).json({ error: 'No connected exchange found. Connect an exchange first.' });
+  }
+
+  try {
+    const result = await syncTradesForUser(req.user.id, conn.api_key, conn.api_secret);
+    res.json({ success: true, ...result });
+  } catch (e) {
+    console.error('[sync]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Bot-facing sync (called by bot via bot token on startup)
+app.post('/api/bot/sync', requireBotToken, async (req, res) => {
+  const bot = req.bot;
+  let apiKey = '', apiSecret = '';
+  if (bot.exchange_id) {
+    const { data: ex } = await supabase.from('exchange_connections')
+      .select('api_key, api_secret').eq('id', bot.exchange_id).single();
+    apiKey = ex?.api_key || ''; apiSecret = ex?.api_secret || '';
+  }
+  if (!apiKey) return res.json({ success: true, message: 'No exchange credentials — skipping sync' });
+
+  try {
+    const result = await syncTradesForUser(bot.user_id, apiKey, apiSecret);
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/health', (_req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
 app.listen(PORT, () => console.log(`NexusBot API server on http://127.0.0.1:${PORT}`));
