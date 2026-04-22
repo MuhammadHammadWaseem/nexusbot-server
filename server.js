@@ -29,6 +29,38 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// ── In-process balance cache (30s TTL) ───────────────────────────────────
+// Prevents hammering testnet.binancefuture.com on every Dashboard load.
+// The balance endpoint is non-critical — stale by 30s is acceptable.
+const balanceCache = new Map(); // key = user_id → { data, expiresAt }
+const BALANCE_TTL_MS = 30_000;
+
+function getCachedBalance(userId) {
+  const entry = balanceCache.get(userId);
+  if (entry && entry.expiresAt > Date.now()) return entry.data;
+  return null;
+}
+function setCachedBalance(userId, data) {
+  balanceCache.set(userId, { data, expiresAt: Date.now() + BALANCE_TTL_MS });
+}
+
+// ── Suppress repeated fetch-timeout console noise ────────────────────────
+let _lastFetchErrMsg = '';
+let _fetchErrCount   = 0;
+function logFetchError(endpoint, err) {
+  const msg = `[${endpoint}] ${err?.cause?.code || err?.message || err}`;
+  if (msg === _lastFetchErrMsg) {
+    _fetchErrCount++;
+    // Only log every 10th repeat to avoid log spam
+    if (_fetchErrCount % 10 !== 0) return;
+    console.warn(`[EXCHANGE] ${endpoint}: ${err?.cause?.code || 'fetch failed'} (×${_fetchErrCount}, suppressed repeats)`);
+  } else {
+    _lastFetchErrMsg = msg;
+    _fetchErrCount   = 1;
+    console.warn(`[EXCHANGE] ${endpoint}: ${err?.cause?.code || 'fetch failed'} — is testnet.binancefuture.com reachable?`);
+  }
+}
+
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
 app.use(express.json({ limit: '1mb' }));
 
@@ -391,7 +423,10 @@ app.post('/api/exchange/test', requireUser, async (req, res) => {
     const sig = crypto.createHmac('sha256', conn.api_secret).update(query).digest('hex');
     // Always test against testnet
     const url = `https://testnet.binancefuture.com/fapi/v2/balance?${query}&signature=${sig}`;
-    const response = await fetch(url, { headers: { 'X-MBX-APIKEY': conn.api_key } });
+    const response = await fetch(url, {
+      headers: { 'X-MBX-APIKEY': conn.api_key },
+      signal: AbortSignal.timeout(8000),
+    });
     const data = await response.json();
     const connected = response.ok && Array.isArray(data);
     await supabase.from('exchange_connections').update({ is_connected: connected, last_tested_at: new Date().toISOString() }).eq('id', conn.id);
@@ -639,6 +674,10 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
     return res.json({ total_balance: 0, available_balance: 0, unrealized_pnl: 0, connected: false });
   }
 
+  // Check cache first — avoids hammering exchange on every Dashboard render
+  const cached = getCachedBalance(req.user.id);
+  if (cached) return res.json(cached);
+
   try {
     const ts    = Date.now();
     const query = `timestamp=${ts}`;
@@ -652,29 +691,27 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
 
     if (!response.ok) {
       const err = await response.json().catch(() => ({}));
-      return res.json({ total_balance: 0, available_balance: 0, unrealized_pnl: 0,
-                        connected: false, error: err.msg || 'Exchange error' });
+      const result = { total_balance: 0, available_balance: 0, unrealized_pnl: 0,
+                       connected: false, error: err.msg || 'Exchange error' };
+      return res.json(result);
     }
 
-    const data = await response.json();   // array of asset balances
-    const usdt = Array.isArray(data)
-      ? data.find(b => b.asset === 'USDT')
-      : null;
+    const data = await response.json();
+    const usdt = Array.isArray(data) ? data.find(b => b.asset === 'USDT') : null;
 
-    if (!usdt) {
-      return res.json({ total_balance: 0, available_balance: 0, unrealized_pnl: 0, connected: true });
-    }
-
-    res.json({
+    const result = usdt ? {
       total_balance:     parseFloat(usdt.balance          || 0),
       available_balance: parseFloat(usdt.availableBalance || 0),
       unrealized_pnl:    parseFloat(usdt.crossUnPnl       || 0),
       connected:         true,
-    });
+    } : { total_balance: 0, available_balance: 0, unrealized_pnl: 0, connected: true };
+
+    setCachedBalance(req.user.id, result);
+    res.json(result);
   } catch (e) {
-    console.error('[balance]', e.message);
+    logFetchError('/api/user/balance', e);   // suppresses repeated spam
     res.json({ total_balance: 0, available_balance: 0, unrealized_pnl: 0,
-               connected: false, error: e.message });
+               connected: false, error: 'Exchange unreachable' });
   }
 });
 
