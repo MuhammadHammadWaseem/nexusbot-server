@@ -113,6 +113,7 @@ app.post('/api/bot/trade/open', requireBotToken, async (req, res) => {
     trading_pair: symbol, trade_type: side === 'long' ? 'long' : 'short',
     entry_price, quantity, leverage: leverage || 5, tp_price, sl_price,
     confidence, signal_type, regime, order_id, status: 'open',
+    is_paper: (bot.trading_mode === 'paper'),  // correctly flags paper trades
     opened_at: opened_at || new Date().toISOString(),
   }).select('id').single();
 
@@ -292,10 +293,16 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
   if (error || !bot) return res.status(404).json({ error: 'Bot not found' });
   if (bot.is_running) return res.json({ success: true, message: 'Already running' });
 
-  const { data: sub } = await supabase.from('subscriptions').select('remaining_trades, is_active, expires_at')
-    .eq('user_id', req.user.id).eq('is_active', true).maybeSingle();
-  if (!sub || sub.remaining_trades <= 0) return res.status(402).json({ error: 'No remaining trades.' });
+  const { data: sub } = await supabase.from('subscriptions')
+    .select('remaining_trades, is_active, expires_at')
+    .eq('user_id', req.user.id)
+    .eq('is_active', true)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (!sub) return res.status(402).json({ error: 'No active subscription. Please subscribe to start bots.' });
   if (new Date(sub.expires_at) < new Date()) return res.status(402).json({ error: 'Subscription expired.' });
+  if (sub.remaining_trades <= 0) return res.status(402).json({ error: 'No remaining trades in your plan.' });
 
   const botToken = crypto.randomBytes(32).toString('hex');
   await supabase.from('bots').update({ bot_token: botToken, is_running: true, updated_at: new Date().toISOString() }).eq('id', botId);
@@ -311,8 +318,8 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
       .select('api_key, api_secret')
       .eq('id', bot.exchange_id)
       .single();
-    apiKey    = ex?.api_key    || '';
-    apiSecret = ex?.api_secret || '';
+    apiKey    = (ex?.api_key    || '').trim();
+    apiSecret = (ex?.api_secret || '').trim();
   }
 
   // Config keys must match EXACTLY what run_bot_managed.py reads:
@@ -334,13 +341,19 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
     timeframe:  bot.timeframe,
     leverage:   bot.leverage    || 5,
     // Exchange credentials
-    api_key:    apiKey,
-    api_secret: apiSecret,
-    is_testnet: true,
+    api_key:      apiKey,
+    api_secret:   apiSecret,
+    is_testnet:   false,           // only real keys accepted
+    trading_mode: bot.trading_mode || 'paper',
+    paper_balance: bot.paper_balance || 10000,
     // Risk settings (map from bot DB columns to config keys bot expects)
+    // risk_per_trade_pct: Python bot divides by 100 internally.
+    // Send as a true percentage: $500 trade on $10000 balance = 5.0%
+    // So: risk_amount = $10000 × (5.0/100) = $500 → position = $500 × leverage ✅
+    // BUG WAS: sending 0.01 → bot computed $1000 × (0.01/100) = $0.10 → $100 notional
     risk_per_trade:            (bot.trade_amount_type === 'percent')
-                                 ? (Number(bot.trade_amount) / 100)
-                                 : 0.01,   // default 1% if fixed-amount mode
+                                 ? Number(bot.trade_amount)   // already a %
+                                 : (Number(bot.trade_amount) / Number(bot.paper_balance || 10000)) * 100,
     daily_loss_limit:          Number(bot.daily_max_loss)     || 50,
     take_profit_pct:           Number(bot.take_profit_percent)|| 3.0,
     stop_loss_pct:             Number(bot.stop_loss_percent)  || 2.0,
@@ -418,20 +431,53 @@ app.post('/api/exchange/test', requireUser, async (req, res) => {
     .eq('id', exchange_connection_id).eq('user_id', req.user.id).single();
   if (!conn) return res.status(404).json({ error: 'Connection not found' });
   try {
-    const ts = Date.now();
-    const query = `timestamp=${ts}`;
-    const sig = crypto.createHmac('sha256', conn.api_secret).update(query).digest('hex');
-    // Always test against testnet
-    const url = `https://testnet.binancefuture.com/fapi/v2/balance?${query}&signature=${sig}`;
+    // Trim keys defensively — guards against whitespace from copy-paste or DB storage
+    const apiKey    = (conn.api_key    || '').trim();
+    const apiSecret = (conn.api_secret || '').trim();
+    if (!apiKey || !apiSecret) {
+      return res.json({ connected: false, message: 'API key or secret is empty — please re-enter your credentials.' });
+    }
+
+    const ts    = Date.now();
+    // recvWindow=10000 gives a 10s tolerance for clock skew between server and Binance
+    const query = `timestamp=${ts}&recvWindow=10000`;
+    const sig   = crypto.createHmac('sha256', apiSecret).update(query).digest('hex');
+    const url   = `https://fapi.binance.com/fapi/v2/balance?${query}&signature=${sig}`;
     const response = await fetch(url, {
-      headers: { 'X-MBX-APIKEY': conn.api_key },
-      signal: AbortSignal.timeout(8000),
+      headers: { 'X-MBX-APIKEY': apiKey },
+      signal: AbortSignal.timeout(10_000),
     });
     const data = await response.json();
+
+    // Binance returns -2015 for IP restriction and -2014 for bad key format
     const connected = response.ok && Array.isArray(data);
-    await supabase.from('exchange_connections').update({ is_connected: connected, last_tested_at: new Date().toISOString() }).eq('id', conn.id);
-    res.json({ connected, message: connected ? 'Testnet connection verified' : (data?.msg || 'Failed') });
-  } catch (e) { res.json({ connected: false, message: e.message }); }
+    let message = connected ? 'Connected to Binance Futures' : (data?.msg || 'Connection failed');
+
+    // Translate opaque Binance errors into actionable messages
+    const serverIp = await getServerPublicIp();
+    if (!connected) {
+      if (data?.code === -2015 || data?.code === -2014) {
+        message = serverIp
+          ? `IP not whitelisted. In Binance API Management → Edit Restrictions → add this IP to the whitelist: ${serverIp}`
+          : "IP restriction error. Open Binance API Management → Edit Restrictions and add this server's public IP to the whitelist.";
+      } else if (data?.code === -1021) {
+        message = 'Timestamp error — server clock may be out of sync. Try again.';
+      } else if (data?.code === -2011) {
+        message = 'Enable Futures trading permission on this API key in Binance settings.';
+      }
+    }
+
+    await supabase.from('exchange_connections')
+      .update({ is_connected: connected, last_tested_at: new Date().toISOString() })
+      .eq('id', conn.id);
+
+    res.json({ connected, message, binance_code: data?.code || null, server_ip: serverIp });
+  } catch (e) {
+    const msg = e?.cause?.code === 'ECONNREFUSED'
+      ? 'Cannot reach Binance — check your internet connection.'
+      : (e.message || 'Connection error');
+    res.json({ connected: false, message: msg });
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -659,12 +705,13 @@ app.put('/api/bots/:id', requireUser, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/user/balance', requireUser, async (req, res) => {
-  // Get the first connected exchange for this user
+  // Get the first exchange for this user — do NOT filter by is_connected.
+  // is_connected can be false due to IP restriction during the test, even
+  // though keys are saved and Binance accepts them. Always try to fetch.
   const { data: conn } = await supabase
     .from('exchange_connections')
     .select('api_key, api_secret')
     .eq('user_id', req.user.id)
-    .eq('is_connected', true)
     .order('created_at', { ascending: true })
     .limit(1)
     .maybeSingle();
@@ -680,9 +727,9 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
 
   try {
     const ts    = Date.now();
-    const query = `timestamp=${ts}`;
-    const sig   = crypto.createHmac('sha256', conn.api_secret).update(query).digest('hex');
-    const url   = `https://testnet.binancefuture.com/fapi/v2/balance?${query}&signature=${sig}`;
+    const query = `timestamp=${ts}&recvWindow=10000`;
+    const sig   = crypto.createHmac('sha256', (conn.api_secret || '').trim()).update(query).digest('hex');
+    const url   = `https://fapi.binance.com/fapi/v2/balance?${query}&signature=${sig}`;
 
     const response = await fetch(url, {
       headers: { 'X-MBX-APIKEY': conn.api_key },
@@ -691,8 +738,10 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
 
     if (!response.ok) {
       const err = await response.json().catch(() => ({}));
+      // Keys exist but Binance rejected the call (IP restriction, clock skew, etc.).
+      // Return connected:true so the UI shows the exchange as linked — just without balance.
       const result = { total_balance: 0, available_balance: 0, unrealized_pnl: 0,
-                       connected: false, error: err.msg || 'Exchange error' };
+                       connected: true, balance_error: err.msg || 'Could not fetch balance' };
       return res.json(result);
     }
 
@@ -750,9 +799,9 @@ async function syncTradesForUser(userId, apiKey, apiSecret) {
 
   // 2. Fetch all open positions from exchange (one call, all symbols)
   const ts    = Date.now();
-  const query = `timestamp=${ts}`;
-  const sig   = crypto.createHmac('sha256', apiSecret).update(query).digest('hex');
-  const url   = `https://testnet.binancefuture.com/fapi/v2/positionRisk?${query}&signature=${sig}`;
+  const query = `timestamp=${ts}&recvWindow=10000`;
+  const sig   = crypto.createHmac('sha256', (apiSecret || '').trim()).update(query).digest('hex');
+  const url   = `https://fapi.binance.com/fapi/v2/positionRisk?${query}&signature=${sig}`;
 
   let exchangePositions = [];
   try {
@@ -850,17 +899,17 @@ async function syncTradesForUser(userId, apiKey, apiSecret) {
 
 // User-facing sync (called from Bots page "Sync" button)
 app.post('/api/user/sync-trades', requireUser, async (req, res) => {
+  // Don't gate on is_connected — IP restriction can mark it false even with valid keys
   const { data: conn } = await supabase
     .from('exchange_connections')
     .select('api_key, api_secret')
     .eq('user_id', req.user.id)
-    .eq('is_connected', true)
     .order('created_at', { ascending: true })
     .limit(1)
     .maybeSingle();
 
   if (!conn?.api_key) {
-    return res.status(400).json({ error: 'No connected exchange found. Connect an exchange first.' });
+    return res.status(400).json({ error: 'No exchange connection found. Add your Binance API keys in Settings.' });
   }
 
   try {
@@ -889,6 +938,195 @@ app.post('/api/bot/sync', requireBotToken, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PAPER / LIVE MODE SYSTEM
+// Add these routes to server.js
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Validate exchange keys (real keys only) ───────────────────────────────
+// Called by frontend when user saves a new exchange connection.
+// Returns { valid, is_testnet, balance, message }
+app.post('/api/exchange/validate', requireUser, async (req, res) => {
+  const { api_key, api_secret } = req.body;
+  if (!api_key || !api_secret) {
+    return res.status(400).json({ valid: false, message: 'api_key and api_secret are required' });
+  }
+
+  // Heuristic: testnet keys are <40 chars
+  if (api_key.trim().length < 40) {
+    return res.json({
+      valid:      false,
+      is_testnet: true,
+      balance:    0,
+      message:    'Please connect real Binance API keys. Testnet keys are not supported — create keys at binance.com > Profile > API Management, then enable Futures trading.',
+    });
+  }
+
+  // Full validation against real Binance endpoint
+  try {
+    const ts    = Date.now();
+    const query = `timestamp=${ts}&recvWindow=10000`;
+    const sig   = crypto.createHmac('sha256', api_secret.trim()).update(query).digest('hex');
+    // Real Binance endpoint (NOT testnet)
+    const url   = `https://fapi.binance.com/fapi/v2/balance?${query}&signature=${sig}`;
+
+    const response = await fetch(url, {
+      headers: { 'X-MBX-APIKEY': api_key.trim() },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      // Code -2014 or -2015 = invalid keys
+      const isAuthError = data?.code === -2014 || data?.code === -2015;
+      return res.json({
+        valid:      false,
+        is_testnet: false,
+        balance:    0,
+        message:    isAuthError
+          ? 'Invalid API key or secret. Please check your credentials and ensure Futures trading is enabled.'
+          : (data?.msg || 'Connection failed'),
+      });
+    }
+
+    if (!Array.isArray(data)) {
+      return res.json({ valid: false, balance: 0, message: 'Unexpected response from Binance' });
+    }
+
+    const usdt = data.find(b => b.asset === 'USDT');
+    const balance = parseFloat(usdt?.availableBalance || 0);
+
+    // Mark the exchange_connection as verified real
+    if (req.body.exchange_connection_id) {
+      await supabase.from('exchange_connections')
+        .update({ is_connected: true, is_verified_real: true, last_tested_at: new Date().toISOString() })
+        .eq('id', req.body.exchange_connection_id)
+        .eq('user_id', req.user.id);
+    }
+
+    return res.json({ valid: true, is_testnet: false, balance, message: 'Connected' });
+
+  } catch (e) {
+    return res.json({ valid: false, balance: 0, message: `Connection error: ${e.message}` });
+  }
+});
+
+// ── Switch bot trading mode ──────────────────────────────────────────────
+// PUT /api/bots/:id/trading-mode  { mode: "paper" | "live" }
+app.put('/api/bots/:id/trading-mode', requireUser, async (req, res) => {
+  const { id: botId } = req.params;
+  const { mode }      = req.body;
+
+  if (!['paper', 'live'].includes(mode)) {
+    return res.status(400).json({ error: 'mode must be "paper" or "live"' });
+  }
+
+  const { data: bot, error } = await supabase.from('bots')
+    .select('*').eq('id', botId).eq('user_id', req.user.id).single();
+  if (error || !bot) return res.status(404).json({ error: 'Bot not found' });
+
+  if (bot.is_running) {
+    return res.status(409).json({
+      error: 'Stop the bot before switching trading mode.',
+    });
+  }
+
+  // For live mode: verify exchange connection has real (non-testnet) keys
+  if (mode === 'live' && bot.exchange_id) {
+    const { data: conn } = await supabase.from('exchange_connections')
+      .select('is_verified_real').eq('id', bot.exchange_id).single();
+    if (!conn?.is_verified_real) {
+      return res.status(422).json({
+        error: 'Please connect and validate real Binance API keys before switching to live mode.',
+      });
+    }
+  }
+
+  const { data: updated } = await supabase.from('bots')
+    .update({ trading_mode: mode, updated_at: new Date().toISOString() })
+    .eq('id', botId).select().single();
+
+  res.json({ success: true, bot: updated });
+});
+
+
+
+// ── Server public IP cache ─────────────────────────────────────────────────
+let _cachedServerIp = null;
+
+async function getServerPublicIp() {
+  if (_cachedServerIp) return _cachedServerIp;
+
+  // Try HTTP sources in parallel — first winner wins, others are ignored
+  const sources = [
+    'https://api.ipify.org',
+    'https://checkip.amazonaws.com',
+    'https://icanhazip.com',
+    'https://ipecho.net/plain',
+  ];
+
+  const fetchIp = async (url) => {
+    const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const ip = (await res.text()).trim();
+    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) throw new Error('not an IP');
+    return ip;
+  };
+
+  // Race all sources — first one to resolve wins
+  try {
+    const ip = await Promise.any(sources.map(fetchIp));
+    _cachedServerIp = ip;
+    return ip;
+  } catch (_) {
+    // All sources failed — last resort: use the local machine address
+    // This won't be the public IP but is better than nothing
+    return null;
+  }
+}
+
+// GET /api/server-ip — returns this server's outbound public IP
+// Used by the frontend to tell users which IP to add to Binance whitelist
+app.get('/api/server-ip', async (_req, res) => {
+  const ip = await getServerPublicIp();
+  res.json({
+    ip,
+    available: !!ip,
+    message: ip
+      ? `Add this IP to your Binance API key whitelist: ${ip}`
+      : 'Could not detect server IP.',
+  });
+});
+
+// ── Reliable subscription status ────────────────────────────────────────────
+// Returns the most recent active subscription for the authenticated user.
+// Always orders by created_at DESC and filters is_active=true so stale rows
+// from previous cancelled subscriptions are never returned.
+app.get('/api/user/subscription', requireUser, async (req, res) => {
+  const { data: sub, error } = await supabase
+    .from('subscriptions')
+    .select('*')
+    .eq('user_id', req.user.id)
+    .eq('is_active', true)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: error.message });
+  if (!sub)  return res.json({ active: false, subscription: null });
+
+  // Check expiry
+  const expired = sub.expires_at && new Date(sub.expires_at) < new Date();
+  if (expired) {
+    // Mark it inactive so future queries are clean
+    await supabase.from('subscriptions').update({ is_active: false }).eq('id', sub.id);
+    return res.json({ active: false, subscription: null, reason: 'expired' });
+  }
+
+  res.json({ active: true, subscription: sub });
 });
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
