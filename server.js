@@ -61,8 +61,42 @@ function logFetchError(endpoint, err) {
   }
 }
 
-app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
+// ── CORS: allow production domain + local dev ─────────────────────────────
+const ALLOWED_ORIGINS = [
+  process.env.FRONTEND_URL,          // set in .env → https://ecom-accelerate.com
+  'https://ecom-accelerate.com',      // production domain
+  'https://www.ecom-accelerate.com',  // www variant
+  'http://localhost:5173',            // local Vite dev
+  'http://127.0.0.1:5173',
+].filter(Boolean);
+
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow requests with no origin (curl, Postman, same-origin server calls)
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS blocked: ${origin}`));
+  },
+  credentials: true,
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+}));
+
+// Handle OPTIONS preflight for all routes
+app.options('*', cors());
 app.use(express.json({ limit: '1mb' }));
+
+// ── Strip /api-server prefix injected by Nginx proxy ──────────────────────
+// Nginx config:  location /api-server/ { proxy_pass http://127.0.0.1:3001/; }
+// Browser sends: POST https://ecom-accelerate.com/api-server/api/bots/:id/start
+// Nginx forwards: POST http://127.0.0.1:3001/api/bots/:id/start  (trailing slash strips it)
+// BUT if Nginx does NOT strip it, Node receives /api-server/api/... and no route matches.
+// This middleware handles BOTH cases safely.
+app.use((req, _res, next) => {
+  if (req.path.startsWith('/api-server')) {
+    req.url = req.url.slice('/api-server'.length) || '/';
+  }
+  next();
+});
 
 // ── Auth middleware ────────────────────────────────────────────────────────
 
@@ -335,7 +369,11 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
     bot_id:     botId,
     bot_token:  botToken,
     // Reporter URL — bot reads config["laravel_api_url"] to build endpoint URLs
-    laravel_api_url: `${process.env.API_BASE_URL || 'http://127.0.0.1:3001'}/api/bot`,
+    // BOT_API_URL: the URL the Python bot uses to call this Node server.
+    // The bot runs on the SAME VPS — always use 127.0.0.1, never the public domain.
+    // Routing through the public domain adds unnecessary Nginx overhead.
+    // In .env: BOT_API_URL=http://127.0.0.1:3001  (loopback, fastest path)
+    laravel_api_url: `${process.env.BOT_API_URL || 'http://127.0.0.1:3001'}/api/bot`,
     // Trading params
     symbol:     bot.trading_pair,
     timeframe:  bot.timeframe,
@@ -949,45 +987,74 @@ app.post('/api/bot/sync', requireBotToken, async (req, res) => {
 // Called by frontend when user saves a new exchange connection.
 // Returns { valid, is_testnet, balance, message }
 app.post('/api/exchange/validate', requireUser, async (req, res) => {
-  const { api_key, api_secret } = req.body;
+  const { api_key, api_secret, exchange_connection_id } = req.body;
   if (!api_key || !api_secret) {
     return res.status(400).json({ valid: false, message: 'api_key and api_secret are required' });
   }
 
-  // Heuristic: testnet keys are <40 chars
-  if (api_key.trim().length < 40) {
+  const key    = api_key.trim();
+  const secret = api_secret.trim();
+
+  // ── Format checks (no network call — avoids geo-blocking on US VPS) ────────
+  // Binance real API keys are 64 hex chars; secrets are also 64 chars.
+  // Testnet keys are shorter (<40 chars).
+  if (key.length < 40) {
     return res.json({
-      valid:      false,
-      is_testnet: true,
-      balance:    0,
-      message:    'Please connect real Binance API keys. Testnet keys are not supported — create keys at binance.com > Profile > API Management, then enable Futures trading.',
+      valid: false, is_testnet: true, balance: 0,
+      message: 'These look like testnet keys (too short). Please use real Binance API keys from binance.com → Profile → API Management.',
+    });
+  }
+  if (key.length < 60 || secret.length < 60) {
+    return res.json({
+      valid: false, is_testnet: false, balance: 0,
+      message: 'API key or secret looks too short. Please double-check you copied the full key.',
     });
   }
 
-  // Full validation against real Binance endpoint
+  // ── Attempt live Binance validation ─────────────────────────────────────────
+  // This may fail on US-hosted servers due to geo-restrictions.
+  // If it fails with a geo error, we skip validation and save the keys anyway —
+  // the bot will discover bad keys immediately when it starts.
   try {
     const ts    = Date.now();
     const query = `timestamp=${ts}&recvWindow=10000`;
-    const sig   = crypto.createHmac('sha256', api_secret.trim()).update(query).digest('hex');
-    // Real Binance endpoint (NOT testnet)
+    const sig   = crypto.createHmac('sha256', secret).update(query).digest('hex');
     const url   = `https://fapi.binance.com/fapi/v2/balance?${query}&signature=${sig}`;
 
     const response = await fetch(url, {
-      headers: { 'X-MBX-APIKEY': api_key.trim() },
-      signal: AbortSignal.timeout(10_000),
+      headers: { 'X-MBX-APIKEY': key },
+      signal: AbortSignal.timeout(8_000),
     });
 
     const data = await response.json();
 
+    // Geo-restriction: Binance returns 451 or specific msg
+    const isGeoBlocked = response.status === 451 ||
+      (data?.msg && (
+        data.msg.includes('restricted location') ||
+        data.msg.includes('Eligibility') ||
+        data.msg.includes('unavailable')
+      ));
+
+    if (isGeoBlocked) {
+      // Can't validate from this server location — save keys and trust format check
+      if (exchange_connection_id) {
+        await supabase.from('exchange_connections')
+          .update({ is_connected: true, last_tested_at: new Date().toISOString() })
+          .eq('id', exchange_connection_id).eq('user_id', req.user.id);
+      }
+      return res.json({
+        valid: true, is_testnet: false, balance: 0,
+        message: 'Keys saved. Live balance check skipped (server location restriction). The bot will verify keys on start.',
+      });
+    }
+
     if (!response.ok) {
-      // Code -2014 or -2015 = invalid keys
       const isAuthError = data?.code === -2014 || data?.code === -2015;
       return res.json({
-        valid:      false,
-        is_testnet: false,
-        balance:    0,
-        message:    isAuthError
-          ? 'Invalid API key or secret. Please check your credentials and ensure Futures trading is enabled.'
+        valid: false, is_testnet: false, balance: 0,
+        message: isAuthError
+          ? 'Invalid API key or secret. Check credentials and ensure Futures trading is enabled.'
           : (data?.msg || 'Connection failed'),
       });
     }
@@ -996,21 +1063,27 @@ app.post('/api/exchange/validate', requireUser, async (req, res) => {
       return res.json({ valid: false, balance: 0, message: 'Unexpected response from Binance' });
     }
 
-    const usdt = data.find(b => b.asset === 'USDT');
+    const usdt    = data.find(b => b.asset === 'USDT');
     const balance = parseFloat(usdt?.availableBalance || 0);
 
-    // Mark the exchange_connection as verified real
-    if (req.body.exchange_connection_id) {
+    if (exchange_connection_id) {
       await supabase.from('exchange_connections')
         .update({ is_connected: true, is_verified_real: true, last_tested_at: new Date().toISOString() })
-        .eq('id', req.body.exchange_connection_id)
-        .eq('user_id', req.user.id);
+        .eq('id', exchange_connection_id).eq('user_id', req.user.id);
     }
-
     return res.json({ valid: true, is_testnet: false, balance, message: 'Connected' });
 
   } catch (e) {
-    return res.json({ valid: false, balance: 0, message: `Connection error: ${e.message}` });
+    // Network error / timeout — save keys anyway, format check passed
+    if (exchange_connection_id) {
+      await supabase.from('exchange_connections')
+        .update({ is_connected: true, last_tested_at: new Date().toISOString() })
+        .eq('id', exchange_connection_id).eq('user_id', req.user.id);
+    }
+    return res.json({
+      valid: true, is_testnet: false, balance: 0,
+      message: 'Keys saved. Could not reach Binance from this server to verify balance. The bot will confirm keys on start.',
+    });
   }
 });
 
@@ -1059,6 +1132,11 @@ let _cachedServerIp = null;
 
 async function getServerPublicIp() {
   if (_cachedServerIp) return _cachedServerIp;
+  // SERVER_IP env var bypasses all HTTP fetches (set in .env when ipify is blocked)
+  if (process.env.SERVER_IP) {
+    _cachedServerIp = process.env.SERVER_IP;
+    return _cachedServerIp;
+  }
 
   // Try HTTP sources in parallel — first winner wins, others are ignored
   const sources = [
@@ -1131,4 +1209,4 @@ app.get('/api/user/subscription', requireUser, async (req, res) => {
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
-app.listen(PORT, () => console.log(`NexusBot API server on http://127.0.0.1:${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`NexusBot API server on port ${PORT} (all interfaces)`));
