@@ -4,8 +4,8 @@
  *
  * Changes in this version:
  *   + GET /api/market/analysis/:symbol  — real signal data from bot's signals table
- *   + is_paper_trading always true in /api/bot/config (testnet only)
- *   + Exchange test URL points to testnet endpoint
+ *   + /api/bot/config reflects paper/live trading mode
+ *   + Exchange tests use Binance Futures live endpoints
  */
 
 import express from 'express';
@@ -17,20 +17,141 @@ import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import Stripe from 'stripe';
 
 dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app  = express();
 const PORT = process.env.PORT || 3001;
+app.set('etag', false);
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-12-18.acacia' })
+  : null;
+
+const PLAN_CONFIG = {
+  starter: { trades: 15,  bots: 3,  days: 45,  price: 29,  name: 'Starter' },
+  pro:     { trades: 50,  bots: 10, days: 90,  price: 79,  name: 'Pro' },
+  elite:   { trades: 200, bots: 25, days: 180, price: 149, name: 'Elite' },
+};
+
+const PAID_PAYMENT_STATUSES = ['paid'];
+
+async function getActivePaidSubscription(userId) {
+  const { data: sub, error } = await supabase
+    .from('subscriptions')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('is_active', true)
+    .in('payment_status', PAID_PAYMENT_STATUSES)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!sub) return null;
+
+  const expired = sub.expires_at && new Date(sub.expires_at) < new Date();
+  if (expired) {
+    await supabase.from('subscriptions').update({ is_active: false }).eq('id', sub.id);
+    return null;
+  }
+  return sub;
+}
+
+async function activatePaidSubscriptionFromCheckout(session) {
+  if (!session || session.payment_status !== 'paid') return { activated: false };
+
+  const userId   = session.metadata?.user_id;
+  const planType = session.metadata?.plan_type;
+  const plan     = PLAN_CONFIG[planType];
+  if (!userId || !plan) throw new Error('Stripe session is missing valid metadata');
+
+  const { data: existingPayment } = await supabase
+    .from('subscription_payments')
+    .select('id, subscription_id, status')
+    .eq('stripe_checkout_session_id', session.id)
+    .maybeSingle();
+  if (existingPayment?.status === 'paid' && existingPayment.subscription_id) {
+    return { activated: false, subscription_id: existingPayment.subscription_id };
+  }
+
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + plan.days);
+
+  await supabase.from('subscriptions')
+    .update({ is_active: false })
+    .eq('user_id', userId)
+    .eq('is_active', true);
+
+  const { data: sub, error: subErr } = await supabase.from('subscriptions').insert({
+    user_id: userId,
+    plan_type: planType,
+    total_trades: plan.trades,
+    remaining_trades: plan.trades,
+    total_bot_creations: plan.bots,
+    remaining_bot_creations: plan.bots,
+    expires_at: expiresAt.toISOString(),
+    is_active: true,
+    payment_status: 'paid',
+    payment_provider: 'stripe',
+    stripe_checkout_session_id: session.id,
+    stripe_payment_intent_id: typeof session.payment_intent === 'string'
+      ? session.payment_intent
+      : session.payment_intent?.id || null,
+    stripe_customer_id: typeof session.customer === 'string'
+      ? session.customer
+      : session.customer?.id || null,
+    paid_at: new Date().toISOString(),
+  }).select().single();
+  if (subErr) throw subErr;
+
+  const amount = (session.amount_total || plan.price * 100) / 100;
+  const currency = (session.currency || 'usd').toUpperCase();
+
+  const paymentPayload = {
+    user_id: userId,
+    subscription_id: sub.id,
+    plan_type: planType,
+    amount,
+    currency,
+    status: 'paid',
+    provider: 'stripe',
+    stripe_checkout_session_id: session.id,
+    stripe_payment_intent_id: typeof session.payment_intent === 'string'
+      ? session.payment_intent
+      : session.payment_intent?.id || null,
+    stripe_customer_id: typeof session.customer === 'string'
+      ? session.customer
+      : session.customer?.id || null,
+    raw_event: session,
+    paid_at: new Date().toISOString(),
+  };
+
+  if (existingPayment) {
+    await supabase.from('subscription_payments').update(paymentPayload).eq('id', existingPayment.id);
+  } else {
+    await supabase.from('subscription_payments').insert(paymentPayload);
+  }
+
+  await supabase.from('revenue_records').insert({
+    user_id: userId,
+    amount,
+    plan_type: planType,
+    description: `${planType} plan purchase via Stripe Checkout (${currency})`,
+  });
+
+  return { activated: true, subscription_id: sub.id };
+}
+
 // ── In-process balance cache (30s TTL) ───────────────────────────────────
-// Prevents hammering testnet.binancefuture.com on every Dashboard load.
+// Prevents hammering Binance Futures on every Dashboard load.
 // The balance endpoint is non-critical — stale by 30s is acceptable.
 const balanceCache = new Map(); // key = user_id → { data, expiresAt }
 const BALANCE_TTL_MS = 30_000;
@@ -57,7 +178,7 @@ function logFetchError(endpoint, err) {
   } else {
     _lastFetchErrMsg = msg;
     _fetchErrCount   = 1;
-    console.warn(`[EXCHANGE] ${endpoint}: ${err?.cause?.code || 'fetch failed'} — is testnet.binancefuture.com reachable?`);
+    console.warn(`[EXCHANGE] ${endpoint}: ${err?.cause?.code || 'fetch failed'} - is Binance Futures reachable?`);
   }
 }
 
@@ -83,6 +204,47 @@ app.use(cors({
 
 // Handle OPTIONS preflight for all routes
 app.options('*', cors());
+
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+    return res.status(500).json({ error: 'Stripe webhook is not configured' });
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers['stripe-signature'],
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.warn('[stripe/webhook] Signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === 'checkout.session.completed') {
+      await activatePaidSubscriptionFromCheckout(event.data.object);
+    } else if (event.type === 'checkout.session.expired') {
+      const session = event.data.object;
+      await supabase.from('subscription_payments').upsert({
+        user_id: session.metadata?.user_id || null,
+        plan_type: session.metadata?.plan_type || null,
+        amount: (session.amount_total || 0) / 100,
+        currency: (session.currency || 'usd').toUpperCase(),
+        status: 'expired',
+        provider: 'stripe',
+        stripe_checkout_session_id: session.id,
+        raw_event: session,
+      }, { onConflict: 'stripe_checkout_session_id' });
+    }
+    res.json({ received: true });
+  } catch (err) {
+    console.error('[stripe/webhook]', err);
+    res.status(500).json({ error: 'Webhook processing failed' });
+  }
+});
+
 app.use(express.json({ limit: '1mb' }));
 
 // ── Strip /api-server prefix injected by Nginx proxy ──────────────────────
@@ -230,8 +392,8 @@ app.get('/api/bot/config/:bot_id', requireBotToken, async (req, res) => {
     max_trades_per_day: bot.max_trades_per_day, trade_amount: bot.trade_amount,
     trade_amount_type: bot.trade_amount_type, daily_max_loss: bot.daily_max_loss,
     max_open_trades: bot.max_open_trades,
-    is_paper_trading: true,   // always testnet in current setup
-    exchange: { name: 'binance', api_key: apiKey, api_secret: apiSecret, testnet: true },
+    is_paper_trading: (bot.trading_mode || 'paper') !== 'live',
+    exchange: { name: 'binance', api_key: apiKey, api_secret: apiSecret, testnet: false },
   });
 });
 
@@ -327,23 +489,10 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
   if (error || !bot) return res.status(404).json({ error: 'Bot not found' });
   if (bot.is_running) return res.json({ success: true, message: 'Already running' });
 
-  const { data: sub } = await supabase.from('subscriptions')
-    .select('remaining_trades, is_active, expires_at')
-    .eq('user_id', req.user.id)
-    .eq('is_active', true)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  if (!sub) return res.status(402).json({ error: 'No active subscription. Please subscribe to start bots.' });
-  if (new Date(sub.expires_at) < new Date()) return res.status(402).json({ error: 'Subscription expired.' });
+  const sub = await getActivePaidSubscription(req.user.id);
+  if (!sub) return res.status(402).json({ error: 'No paid active subscription. Complete payment before starting bots.' });
   if (sub.remaining_trades <= 0) return res.status(402).json({ error: 'No remaining trades in your plan.' });
 
-  const botToken = crypto.randomBytes(32).toString('hex');
-  await supabase.from('bots').update({ bot_token: botToken, is_running: true, updated_at: new Date().toISOString() }).eq('id', botId);
-
-  const configDir  = process.env.BOT_CONFIG_DIR || path.join(__dirname, '../AITradingBot/bot_configs');
-  fs.mkdirSync(configDir, { recursive: true });
-  const configPath = path.join(configDir, `bot_${botId}.json`);
   // Fetch exchange API keys if a connection is linked
   let apiKey = '', apiSecret = '';
   if (bot.exchange_id) {
@@ -356,10 +505,28 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
     apiSecret = (ex?.api_secret || '').trim();
   }
 
+  if ((bot.trading_mode || 'paper') === 'live') {
+    if (!bot.exchange_id) {
+      return res.status(422).json({ error: 'Live trading requires a connected Binance exchange.' });
+    }
+    if (apiKey.length < 40 || apiSecret.length < 40) {
+      return res.status(422).json({
+        error: 'Live trading requires real Binance API keys. Testnet, missing, or short keys are only valid for paper mode.',
+      });
+    }
+  }
+
+  const botToken = crypto.randomBytes(32).toString('hex');
+  await supabase.from('bots').update({ bot_token: botToken, is_running: true, updated_at: new Date().toISOString() }).eq('id', botId);
+
+  const configDir  = process.env.BOT_CONFIG_DIR || path.join(__dirname, '../AITradingBot/bot_configs');
+  fs.mkdirSync(configDir, { recursive: true });
+  const configPath = path.join(configDir, `bot_${botId}.json`);
+
   // Config keys must match EXACTLY what run_bot_managed.py reads:
   //   config["api_key"]                  → exchange key
   //   config["api_secret"]               → exchange secret
-  //   config["is_testnet"]               → always true (testnet mode)
+  //   config["is_testnet"]               -> false; production uses real Binance keys
   //   config["risk_per_trade"]           → % of balance per trade
   //   config["daily_loss_limit"]         → USDT hard stop per day
   //   config["base_confidence_threshold"]→ ML min confidence (0-100 scale)
@@ -397,6 +564,7 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
     stop_loss_pct:             Number(bot.stop_loss_percent)  || 2.0,
     base_confidence_threshold: Number(bot.min_confidence)     || 68,
     max_open_trades:           Number(bot.max_open_trades)    || 1,
+    max_trades_per_day:        Number(bot.max_trades_per_day) || 5,
   }, null, 2));
 
   const pythonExe = process.env.PYTHON_EXE  || 'python';
@@ -431,30 +599,81 @@ app.post('/api/bots/:id/stop', requireUser, async (req, res) => {
 // SUBSCRIPTIONS
 // ══════════════════════════════════════════════════════════════════════════════
 
-const PLAN_CONFIG = {
-  starter: { trades: 15,  bots: 3,  days: 45,  price: 29 },
-  pro:     { trades: 50,  bots: 10, days: 90,  price: 79 },
-  elite:   { trades: 200, bots: 25, days: 180, price: 149 },
-};
-
 app.post('/api/subscriptions/purchase', requireUser, async (req, res) => {
   const { plan_type } = req.body;
   const plan = PLAN_CONFIG[plan_type];
   if (!plan) return res.status(400).json({ error: 'Invalid plan type' });
-  const expiresAt = new Date(); expiresAt.setDate(expiresAt.getDate() + plan.days);
-  await supabase.from('subscriptions').update({ is_active: false }).eq('user_id', req.user.id).eq('is_active', true);
-  const { data: sub, error } = await supabase.from('subscriptions').insert({
-    user_id: req.user.id, plan_type, total_trades: plan.trades, remaining_trades: plan.trades,
-    total_bot_creations: plan.bots, remaining_bot_creations: plan.bots,
-    expires_at: expiresAt.toISOString(), is_active: true,
-  }).select().single();
-  if (error) return res.status(500).json({ error: error.message });
-  await supabase.from('revenue_records').insert({ user_id: req.user.id, amount: plan.price, plan_type, description: `${plan_type} plan purchase` });
-  res.json({ success: true, subscription: sub });
+  if (!stripe) return res.status(500).json({ error: 'Stripe is not configured on the server.' });
+
+  const frontendUrl = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
+  const session = await stripe.checkout.sessions.create({
+    mode: 'payment',
+    client_reference_id: req.user.id,
+    customer_email: req.user.email || undefined,
+    line_items: [{
+      quantity: 1,
+      price_data: {
+        currency: process.env.STRIPE_CURRENCY || 'usd',
+        unit_amount: plan.price * 100,
+        product_data: {
+          name: `NexusBot ${plan.name} Plan`,
+          description: `${plan.trades} trades, ${plan.bots} bot creations, ${plan.days} days access`,
+        },
+      },
+    }],
+    metadata: {
+      user_id: req.user.id,
+      plan_type,
+    },
+    success_url: `${frontendUrl}/subscription?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${frontendUrl}/subscription?payment=cancelled`,
+  });
+
+  await supabase.from('subscription_payments').insert({
+    user_id: req.user.id,
+    plan_type,
+    amount: plan.price,
+    currency: (process.env.STRIPE_CURRENCY || 'usd').toUpperCase(),
+    status: 'checkout_created',
+    provider: 'stripe',
+    stripe_checkout_session_id: session.id,
+    stripe_customer_id: typeof session.customer === 'string' ? session.customer : null,
+    raw_event: session,
+  });
+
+  res.json({
+    success: true,
+    checkout_url: session.url,
+    url: session.url,
+    session_id: session.id,
+  });
+});
+
+app.post('/api/subscriptions/verify-session', requireUser, async (req, res) => {
+  const { session_id } = req.body;
+  if (!session_id) return res.status(400).json({ error: 'session_id is required' });
+  if (!stripe) return res.status(500).json({ error: 'Stripe is not configured on the server.' });
+
+  const session = await stripe.checkout.sessions.retrieve(session_id);
+  if (session.client_reference_id !== req.user.id && session.metadata?.user_id !== req.user.id) {
+    return res.status(403).json({ error: 'Checkout session does not belong to this user' });
+  }
+
+  if (session.payment_status !== 'paid') {
+    return res.status(402).json({ success: false, status: session.payment_status });
+  }
+
+  await activatePaidSubscriptionFromCheckout(session);
+  const subscription = await getActivePaidSubscription(req.user.id);
+  res.json({ success: true, subscription });
 });
 
 app.post('/api/subscriptions/cancel', requireUser, async (req, res) => {
-  const { error } = await supabase.from('subscriptions').update({ is_active: false }).eq('user_id', req.user.id).eq('is_active', true);
+  const { error } = await supabase.from('subscriptions')
+    .update({ is_active: false })
+    .eq('user_id', req.user.id)
+    .eq('is_active', true)
+    .in('payment_status', PAID_PAYMENT_STATUSES);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
@@ -506,7 +725,7 @@ app.post('/api/exchange/test', requireUser, async (req, res) => {
     }
 
     await supabase.from('exchange_connections')
-      .update({ is_connected: connected, last_tested_at: new Date().toISOString() })
+      .update({ is_connected: connected, is_verified_real: connected, last_tested_at: new Date().toISOString() })
       .eq('id', conn.id);
 
     res.json({ connected, message, binance_code: data?.code || null, server_ip: serverIp });
@@ -587,6 +806,11 @@ app.get('/api/admin/metrics', requireUser, requireAdmin, async (req, res) => {
 });
 
 app.post('/api/admin/subscriptions/grant', requireUser, requireAdmin, async (req, res) => {
+  if (process.env.ALLOW_ADMIN_SUBSCRIPTION_GRANTS !== 'true') {
+    return res.status(403).json({
+      error: 'Manual subscription grants are disabled. Paid Stripe Checkout is required.',
+    });
+  }
   const { user_id, plan_type } = req.body;
   const plan = PLAN_CONFIG[plan_type];
   if (!plan) return res.status(400).json({ error: 'Invalid plan' });
@@ -596,6 +820,8 @@ app.post('/api/admin/subscriptions/grant', requireUser, requireAdmin, async (req
     user_id, plan_type, total_trades: plan.trades, remaining_trades: plan.trades,
     total_bot_creations: plan.bots, remaining_bot_creations: plan.bots,
     expires_at: expiresAt.toISOString(), is_active: true,
+    payment_status: 'admin_granted',
+    payment_provider: 'admin',
   }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   await supabase.from('audit_logs').insert({ admin_id: req.user.id, user_id, action: 'subscription_granted', resource_type: 'subscription', changes: { plan_type } });
@@ -738,62 +964,255 @@ app.put('/api/bots/:id', requireUser, async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // WALLET BALANCE (GET /api/user/balance)
-// Fetches USDT balance directly from Binance testnet using the user's
-// first connected exchange. No bot needs to be running.
+// Fetches USDT balance directly from Binance Futures using the user's
+// best verified Binance connection. No bot needs to be running.
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/user/balance', requireUser, async (req, res) => {
+  res.set({
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+    Pragma: 'no-cache',
+    Expires: '0',
+    'Surrogate-Control': 'no-store',
+  });
+
   // Get the first exchange for this user — do NOT filter by is_connected.
   // is_connected can be false due to IP restriction during the test, even
   // though keys are saved and Binance accepts them. Always try to fetch.
-  const { data: conn } = await supabase
+  let { data: connections, error: connError } = await supabase
     .from('exchange_connections')
-    .select('api_key, api_secret')
+    .select('id, exchange_name, api_key, api_secret, is_connected, is_verified_real, created_at')
     .eq('user_id', req.user.id)
-    .order('created_at', { ascending: true })
-    .limit(1)
-    .maybeSingle();
+    .eq('exchange_name', 'binance')
+    .order('created_at', { ascending: false });
 
-  if (!conn || !conn.api_key) {
+  if (connError) {
+    console.warn(`[BALANCE] primary connection query failed: ${connError.message}`);
+    const fallback = await supabase
+      .from('exchange_connections')
+      .select('id, exchange_name, api_key, api_secret, is_connected, created_at')
+      .eq('user_id', req.user.id)
+      .eq('exchange_name', 'binance')
+      .order('created_at', { ascending: false });
+    connections = fallback.data || [];
+    connError = fallback.error;
+  }
+
+  if (connError) {
+    return res.status(500).json({
+      total_balance: 0,
+      available_balance: 0,
+      unrealized_pnl: 0,
+      connected: false,
+      error: connError.message || 'Could not load exchange connection',
+    });
+  }
+
+  const conn = (connections || []).sort((a, b) => {
+    const score = (row) => (row.is_verified_real ? 2 : 0) + (row.is_connected ? 1 : 0);
+    return score(b) - score(a);
+  })[0];
+
+  if (!conn || !conn.api_key || !conn.api_secret) {
     // No exchange connected — return zeros gracefully
     return res.json({ total_balance: 0, available_balance: 0, unrealized_pnl: 0, connected: false });
   }
 
   // Check cache first — avoids hammering exchange on every Dashboard render
-  const cached = getCachedBalance(req.user.id);
-  if (cached) return res.json(cached);
-
   try {
+    const apiKey = (conn.api_key || '').trim();
+    const apiSecret = (conn.api_secret || '').trim();
+    const keyPreview = apiKey ? `${apiKey.slice(0, 6)}...${apiKey.slice(-4)}` : null;
+    const sourceErrors = [];
+    const sourcesChecked = [];
+    const sign = (query) => crypto.createHmac('sha256', apiSecret).update(query).digest('hex');
+    const recordSourceError = async (source, response, fallback = 'Could not fetch balance') => {
+      const err = await response.json().catch(() => ({}));
+      sourceErrors.push({
+        source,
+        code: err?.code || response.status,
+        message: err?.msg || fallback,
+      });
+      return err;
+    };
+    const stableMarginAssets = new Set(['USDT', 'USDC', 'FDUSD', 'USD1', 'BFUSD', 'RWUSD']);
+    const priceCache = new Map();
+    const getFuturesUsdtPrice = async (asset) => {
+      if (stableMarginAssets.has(asset)) return 1;
+      if (priceCache.has(asset)) return priceCache.get(asset);
+      const priceResponse = await fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${encodeURIComponent(`${asset}USDT`)}`, {
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!priceResponse.ok) throw new Error(`No ${asset}USDT futures ticker`);
+      const priceData = await priceResponse.json();
+      const price = parseFloat(priceData?.price || 0);
+      if (!Number.isFinite(price) || price <= 0) throw new Error(`Invalid ${asset}USDT futures price`);
+      priceCache.set(asset, price);
+      return price;
+    };
+
     const ts    = Date.now();
     const query = `timestamp=${ts}&recvWindow=10000`;
-    const sig   = crypto.createHmac('sha256', (conn.api_secret || '').trim()).update(query).digest('hex');
+    const sig   = sign(query);
     const url   = `https://fapi.binance.com/fapi/v2/balance?${query}&signature=${sig}`;
+    sourcesChecked.push('futures');
 
     const response = await fetch(url, {
-      headers: { 'X-MBX-APIKEY': conn.api_key },
+      headers: { 'X-MBX-APIKEY': apiKey },
       signal: AbortSignal.timeout(8000),
     });
 
     if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
+      const err = await recordSourceError('futures', response, 'Could not fetch futures balance');
+      const serverIp = await getServerPublicIp();
+      let message = err.msg || 'Could not fetch balance';
+      if (err?.code === -2015 || err?.code === -2014) {
+        message = serverIp
+          ? `Binance rejected the balance request. Check API permissions and whitelist this server IP: ${serverIp}`
+          : 'Binance rejected the balance request. Check API permissions and IP whitelist settings.';
+      } else if (err?.code === -1021) {
+        message = 'Binance timestamp error. The server clock may be out of sync.';
+      }
       // Keys exist but Binance rejected the call (IP restriction, clock skew, etc.).
       // Return connected:true so the UI shows the exchange as linked — just without balance.
       const result = { total_balance: 0, available_balance: 0, unrealized_pnl: 0,
-                       connected: true, balance_error: err.msg || 'Could not fetch balance' };
-      return res.json(result);
+                       connected: true, balance_error: message,
+                       binance_code: err?.code || null, server_ip: serverIp || null,
+                       balance_sources_checked: sourcesChecked,
+                       balance_source_errors: sourceErrors,
+                       exchange_connection_id: conn.id,
+                       api_key_preview: keyPreview };
+      // Continue checking Spot/Funding balances; a Futures permission issue should not hide wallet funds.
     }
 
-    const data = await response.json();
-    const usdt = Array.isArray(data) ? data.find(b => b.asset === 'USDT') : null;
+    const data = response.ok ? await response.json() : [];
+    let futuresTotal = 0;
+    let futuresAvailable = 0;
+    let futuresPnl = 0;
+    const futuresAssets = [];
 
-    const result = usdt ? {
-      total_balance:     parseFloat(usdt.balance          || 0),
-      available_balance: parseFloat(usdt.availableBalance || 0),
-      unrealized_pnl:    parseFloat(usdt.crossUnPnl       || 0),
-      connected:         true,
-    } : { total_balance: 0, available_balance: 0, unrealized_pnl: 0, connected: true };
+    if (Array.isArray(data)) {
+      for (const row of data) {
+        const asset = String(row?.asset || '').toUpperCase();
+        const balance = parseFloat(row?.balance || 0);
+        const available = parseFloat(row?.availableBalance || 0);
+        const pnl = parseFloat(row?.crossUnPnl || 0);
+        if (!asset || (balance === 0 && available === 0 && pnl === 0)) continue;
 
-    setCachedBalance(req.user.id, result);
+        try {
+          const price = await getFuturesUsdtPrice(asset);
+          const usdtValue = balance * price;
+          const usdtAvailable = available * price;
+          const usdtPnl = pnl * price;
+          futuresTotal += usdtValue;
+          futuresAvailable += usdtAvailable;
+          futuresPnl += usdtPnl;
+          futuresAssets.push({
+            asset,
+            balance,
+            available_balance: available,
+            unrealized_pnl: pnl,
+            usdt_price: price,
+            usdt_value: usdtValue,
+            usdt_available: usdtAvailable,
+          });
+        } catch (e) {
+          sourceErrors.push({ source: 'futures_price', code: asset, message: e?.message || `Could not price ${asset}` });
+        }
+      }
+    }
+
+    let spotTotal = 0;
+    let spotAvailable = 0;
+    sourcesChecked.push('spot');
+    try {
+      const spotTs = Date.now();
+      const spotQuery = `timestamp=${spotTs}&recvWindow=10000`;
+      const spotSig = sign(spotQuery);
+      const spotResponse = await fetch(`https://api.binance.com/api/v3/account?${spotQuery}&signature=${spotSig}`, {
+        headers: { 'X-MBX-APIKEY': apiKey },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (spotResponse.ok) {
+        const spotData = await spotResponse.json();
+        const spotUsdt = Array.isArray(spotData?.balances)
+          ? spotData.balances.find(b => b.asset === 'USDT')
+          : null;
+        spotAvailable = parseFloat(spotUsdt?.free || 0);
+        spotTotal = spotAvailable + parseFloat(spotUsdt?.locked || 0);
+      } else {
+        await recordSourceError('spot', spotResponse, 'Could not fetch spot balance');
+      }
+    } catch (e) {
+      sourceErrors.push({ source: 'spot', code: 'FETCH_FAILED', message: e?.message || 'Could not fetch spot balance' });
+    }
+
+    let fundingTotal = 0;
+    let fundingAvailable = 0;
+    sourcesChecked.push('funding');
+    try {
+      const fundingTs = Date.now();
+      const fundingParams = new URLSearchParams({
+        asset: 'USDT',
+        needBtcValuation: 'false',
+        timestamp: String(fundingTs),
+        recvWindow: '10000',
+      });
+      const fundingQuery = fundingParams.toString();
+      fundingParams.set('signature', sign(fundingQuery));
+      const fundingResponse = await fetch('https://api.binance.com/sapi/v1/asset/get-funding-asset', {
+        method: 'POST',
+        headers: {
+          'X-MBX-APIKEY': apiKey,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: fundingParams.toString(),
+        signal: AbortSignal.timeout(8000),
+      });
+
+      if (fundingResponse.ok) {
+        const fundingData = await fundingResponse.json();
+        const fundingUsdt = Array.isArray(fundingData)
+          ? fundingData.find(b => b.asset === 'USDT')
+          : null;
+        fundingAvailable = parseFloat(fundingUsdt?.free || 0);
+        fundingTotal = fundingAvailable
+          + parseFloat(fundingUsdt?.locked || 0)
+          + parseFloat(fundingUsdt?.freeze || 0)
+          + parseFloat(fundingUsdt?.withdrawing || 0);
+      } else {
+        await recordSourceError('funding', fundingResponse, 'Could not fetch funding balance');
+      }
+    } catch (e) {
+      sourceErrors.push({ source: 'funding', code: 'FETCH_FAILED', message: e?.message || 'Could not fetch funding balance' });
+    }
+
+    let balanceMessage = '';
+    if (futuresTotal + spotTotal + fundingTotal === 0 && sourceErrors.length === 0) {
+      balanceMessage = keyPreview
+        ? `No USDT found in Futures, Spot, or Funding wallets for API key ${keyPreview}. Confirm this is the same Binance account.`
+        : 'No USDT found in Futures, Spot, or Funding wallets.';
+    }
+
+    const result = {
+      total_balance:             futuresTotal + spotTotal + fundingTotal,
+      available_balance:         futuresAvailable + spotAvailable + fundingAvailable,
+      unrealized_pnl:            futuresPnl,
+      futures_balance:           futuresTotal,
+      futures_available_balance: futuresAvailable,
+      futures_assets:            futuresAssets,
+      spot_balance:              spotTotal,
+      spot_available_balance:    spotAvailable,
+      funding_balance:           fundingTotal,
+      funding_available_balance: fundingAvailable,
+      connected:                 true,
+      balance_error:             balanceMessage || '',
+      balance_sources_checked:   sourcesChecked,
+      balance_source_errors:     sourceErrors,
+      exchange_connection_id:    conn.id,
+      api_key_preview:           keyPreview,
+    };
+
     res.json(result);
   } catch (e) {
     logFetchError('/api/user/balance', e);   // suppresses repeated spam
@@ -817,7 +1236,7 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
 //   4. Return a summary of what was fixed
 //
 // Design notes:
-//   - Uses the user's first connected exchange (same as /api/user/balance)
+//   - Uses the user's Binance exchange connection
 //   - Bot-authenticated version is POST /api/bot/sync — called on bot startup
 //   - Does NOT open new positions — only closes ghost ones
 //   - Safe to call multiple times (idempotent)
@@ -1107,8 +1526,13 @@ app.put('/api/bots/:id/trading-mode', requireUser, async (req, res) => {
     });
   }
 
-  // For live mode: verify exchange connection has real (non-testnet) keys
-  if (mode === 'live' && bot.exchange_id) {
+  // For live mode: require a verified real-key exchange connection.
+  if (mode === 'live') {
+    if (!bot.exchange_id) {
+      return res.status(422).json({
+        error: 'Connect and select a verified Binance exchange before switching to live mode.',
+      });
+    }
     const { data: conn } = await supabase.from('exchange_connections')
       .select('is_verified_real').eq('id', bot.exchange_id).single();
     if (!conn?.is_verified_real) {
@@ -1184,26 +1608,13 @@ app.get('/api/server-ip', async (_req, res) => {
 // Always orders by created_at DESC and filters is_active=true so stale rows
 // from previous cancelled subscriptions are never returned.
 app.get('/api/user/subscription', requireUser, async (req, res) => {
-  const { data: sub, error } = await supabase
-    .from('subscriptions')
-    .select('*')
-    .eq('user_id', req.user.id)
-    .eq('is_active', true)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (error) return res.status(500).json({ error: error.message });
-  if (!sub)  return res.json({ active: false, subscription: null });
-
-  // Check expiry
-  const expired = sub.expires_at && new Date(sub.expires_at) < new Date();
-  if (expired) {
-    // Mark it inactive so future queries are clean
-    await supabase.from('subscriptions').update({ is_active: false }).eq('id', sub.id);
-    return res.json({ active: false, subscription: null, reason: 'expired' });
+  let sub;
+  try {
+    sub = await getActivePaidSubscription(req.user.id);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
   }
-
+  if (!sub)  return res.json({ active: false, subscription: null });
   res.json({ active: true, subscription: sub });
 });
 
