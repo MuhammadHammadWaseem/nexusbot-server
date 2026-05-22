@@ -18,6 +18,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import Stripe from 'stripe';
+import jwt from 'jsonwebtoken';
 
 dotenv.config();
 
@@ -303,9 +304,15 @@ app.post('/api/bot/trade/open', requireBotToken, async (req, res) => {
   const bot = req.bot;
   const { symbol, side, entry_price, quantity, leverage, tp_price, sl_price,
           confidence, signal_type, regime, order_id, opened_at } = req.body;
+  let exchangeName = 'binance';
+  if (bot.exchange_id) {
+    const { data: ex } = await supabase.from('exchange_connections')
+      .select('exchange_name').eq('id', bot.exchange_id).maybeSingle();
+    exchangeName = ex?.exchange_name || 'binance';
+  }
 
   const { data: trade, error } = await supabase.from('trades').insert({
-    bot_id: bot.id, user_id: bot.user_id, exchange_name: 'binance',
+    bot_id: bot.id, user_id: bot.user_id, exchange_name: exchangeName,
     trading_pair: symbol, trade_type: side === 'long' ? 'long' : 'short',
     entry_price, quantity, leverage: leverage || 5, tp_price, sl_price,
     confidence, signal_type, regime, order_id, status: 'open',
@@ -379,10 +386,10 @@ app.get('/api/bot/config/:bot_id', requireBotToken, async (req, res) => {
   const bot = req.bot;
   if (bot.id !== req.params.bot_id) return res.status(403).json({ error: 'Token mismatch' });
 
-  let apiKey = '', apiSecret = '';
+  let apiKey = '', apiSecret = '', exchangeName = 'binance';
   if (bot.exchange_id) {
-    const { data: ex } = await supabase.from('exchange_connections').select('api_key, api_secret').eq('id', bot.exchange_id).single();
-    apiKey = ex?.api_key || ''; apiSecret = ex?.api_secret || '';
+    const { data: ex } = await supabase.from('exchange_connections').select('api_key, api_secret, exchange_name').eq('id', bot.exchange_id).single();
+    apiKey = ex?.api_key || ''; apiSecret = ex?.api_secret || ''; exchangeName = ex?.exchange_name || 'binance';
   }
 
   res.json({
@@ -393,7 +400,7 @@ app.get('/api/bot/config/:bot_id', requireBotToken, async (req, res) => {
     trade_amount_type: bot.trade_amount_type, daily_max_loss: bot.daily_max_loss,
     max_open_trades: bot.max_open_trades,
     is_paper_trading: (bot.trading_mode || 'paper') !== 'live',
-    exchange: { name: 'binance', api_key: apiKey, api_secret: apiSecret, testnet: false },
+    exchange: { name: exchangeName, api_key: apiKey, api_secret: apiSecret, testnet: false },
   });
 });
 
@@ -494,20 +501,28 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
   if (sub.remaining_trades <= 0) return res.status(402).json({ error: 'No remaining trades in your plan.' });
 
   // Fetch exchange API keys if a connection is linked
-  let apiKey = '', apiSecret = '';
+  let apiKey = '', apiSecret = '', exchangeName = 'binance';
   if (bot.exchange_id) {
     const { data: ex } = await supabase
       .from('exchange_connections')
-      .select('api_key, api_secret')
+      .select('api_key, api_secret, exchange_name')
       .eq('id', bot.exchange_id)
       .single();
     apiKey    = (ex?.api_key    || '').trim();
-    apiSecret = (ex?.api_secret || '').trim();
+    apiSecret = ex?.exchange_name === 'coinbase'
+      ? String(ex?.api_secret || '').trim()
+      : (ex?.api_secret || '').trim();
+    exchangeName = ex?.exchange_name || 'binance';
   }
 
   if ((bot.trading_mode || 'paper') === 'live') {
     if (!bot.exchange_id) {
-      return res.status(422).json({ error: 'Live trading requires a connected Binance exchange.' });
+      return res.status(422).json({ error: 'Live trading requires a connected exchange.' });
+    }
+    if (exchangeName === 'coinbase') {
+      return res.status(422).json({
+        error: 'Coinbase balance sync is supported, but live Coinbase order execution is not enabled yet. Use Binance for live bots or keep Coinbase bots in paper mode.',
+      });
     }
     if (apiKey.length < 40 || apiSecret.length < 40) {
       return res.status(422).json({
@@ -548,6 +563,7 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
     // Exchange credentials
     api_key:      apiKey,
     api_secret:   apiSecret,
+    exchange:     exchangeName,
     is_testnet:   false,           // only real keys accepted
     trading_mode: bot.trading_mode || 'paper',
     paper_balance: bot.paper_balance || 10000,
@@ -682,6 +698,212 @@ app.post('/api/subscriptions/cancel', requireUser, async (req, res) => {
 // EXCHANGE
 // ══════════════════════════════════════════════════════════════════════════════
 
+function normalizeCoinbasePrivateKey(secret) {
+  const raw = String(secret || '').trim();
+  try {
+    const parsed = JSON.parse(raw);
+    const key = parsed.privateKey || parsed.private_key || parsed.key || parsed.secret;
+    if (key) return String(key).trim().replace(/\\n/g, '\n');
+  } catch (_) {
+    // Not JSON; treat it as the PEM/private key itself.
+  }
+  return raw.replace(/\\n/g, '\n');
+}
+
+function parseJsonObject(value) {
+  try {
+    const parsed = JSON.parse(String(value || '').trim());
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function getCoinbaseCredentials(conn) {
+  const apiKeyRaw = String(conn.api_key || '').trim();
+  const apiSecretRaw = String(conn.api_secret || '').trim();
+  const keyJson = parseJsonObject(apiKeyRaw);
+  const secretJson = parseJsonObject(apiSecretRaw);
+  const json = keyJson || secretJson || {};
+
+  const keyName = String(
+    json.name ||
+    json.keyName ||
+    json.key_name ||
+    json.apiKeyName ||
+    json.api_key_name ||
+    apiKeyRaw
+  ).trim();
+
+  const privateKey = normalizeCoinbasePrivateKey(
+    json.privateKey ||
+    json.private_key ||
+    json.key ||
+    json.secret ||
+    apiSecretRaw
+  );
+
+  return { keyName, privateKey };
+}
+
+function getCoinbaseKeyType(privateKey) {
+  if (privateKey.includes('BEGIN EC PRIVATE KEY')) return 'EC PRIVATE KEY';
+  if (privateKey.includes('BEGIN PRIVATE KEY')) return 'PRIVATE KEY';
+  return 'UNKNOWN';
+}
+
+function getCoinbaseAuthDebug(keyName, privateKey, method, requestPath, issuer = 'cdp') {
+  const keyParts = String(keyName || '').split('/');
+  return {
+    issuer,
+    uri: `${method.toUpperCase()} api.coinbase.com${requestPath}`,
+    key_name_starts_with_organizations: String(keyName || '').startsWith('organizations/'),
+    key_name_segments: keyParts.length,
+    key_name_preview: keyName ? `${keyName.slice(0, 24)}...${keyName.slice(-12)}` : '',
+    private_key_type: getCoinbaseKeyType(privateKey),
+    private_key_has_begin: privateKey.includes('-----BEGIN'),
+    private_key_has_end: privateKey.includes('-----END'),
+    server_time_utc: new Date().toISOString(),
+  };
+}
+
+function buildCoinbaseJwt(apiKeyName, apiSecret, method, requestPath, issuer = 'cdp') {
+  const keyName = String(apiKeyName || '').trim();
+  const privateKey = normalizeCoinbasePrivateKey(apiSecret);
+
+  if (!keyName.startsWith('organizations/')) {
+    throw new Error('Coinbase API key must be the full key name: organizations/{org_id}/apiKeys/{key_id}');
+  }
+  if (!privateKey.includes('BEGIN EC PRIVATE KEY') && !privateKey.includes('BEGIN PRIVATE KEY')) {
+    throw new Error('Coinbase private key must be the full EC private key PEM.');
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const uri = `${method.toUpperCase()} api.coinbase.com${requestPath}`;
+
+  return jwt.sign(
+    {
+      iss: issuer,
+      sub: keyName,
+      nbf: now - 5,
+      exp: now + 120,
+      uri,
+    },
+    privateKey,
+    {
+      algorithm: 'ES256',
+      noTimestamp: true,
+      header: {
+        kid: keyName,
+        nonce: crypto.randomBytes(16).toString('hex'),
+      },
+    }
+  );
+}
+
+async function coinbaseRequest(conn, method, requestPath, body = null) {
+  const { keyName, privateKey } = getCoinbaseCredentials(conn);
+  const issuers = ['cdp'];
+  let lastErr = null;
+
+  for (const issuer of issuers) {
+    const token = buildCoinbaseJwt(keyName, privateKey, method, requestPath, issuer);
+    const response = await fetch(`https://api.coinbase.com${requestPath}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache',
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(10_000),
+    });
+    const text = await response.text().catch(() => '');
+    let data = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch (_) {
+      data = { raw: text };
+    }
+    if (response.ok) return data;
+
+    const msg = data?.error_details || data?.message || data?.error || text || `HTTP ${response.status}`;
+    const err = new Error(msg);
+    err.status = response.status;
+    err.data = data;
+    err.auth_debug = getCoinbaseAuthDebug(keyName, privateKey, method, requestPath, issuer);
+    lastErr = err;
+
+    if (response.status !== 401) break;
+  }
+
+  throw lastErr || new Error('Coinbase request failed');
+}
+
+async function getCoinbaseUsdPrice(asset) {
+  const symbol = String(asset || '').toUpperCase();
+  if (['USD', 'USDC', 'USDT'].includes(symbol)) return 1;
+  const productId = `${symbol}-USD`;
+  const response = await fetch(`https://api.exchange.coinbase.com/products/${encodeURIComponent(productId)}/ticker`, {
+    headers: { 'Cache-Control': 'no-cache' },
+    signal: AbortSignal.timeout(8_000),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data?.message || `No ${productId} price`);
+  const price = parseFloat(data?.price || 0);
+  if (!Number.isFinite(price) || price <= 0) throw new Error(`Invalid ${productId} price`);
+  return price;
+}
+
+async function getCoinbaseBalance(conn) {
+  const data = await coinbaseRequest(conn, 'GET', '/api/v3/brokerage/accounts');
+  const accounts = Array.isArray(data?.accounts) ? data.accounts : [];
+  let total = 0;
+  let available = 0;
+  const assets = [];
+  const errors = [];
+
+  for (const account of accounts) {
+    const currency = String(account?.currency || '').toUpperCase();
+    const free = parseFloat(account?.available_balance?.value || 0);
+    const hold = parseFloat(account?.hold?.value || 0);
+    const amount = free + hold;
+    if (!currency || amount <= 0) continue;
+
+    try {
+      const price = await getCoinbaseUsdPrice(currency);
+      const usdValue = amount * price;
+      const usdAvailable = free * price;
+      total += usdValue;
+      available += usdAvailable;
+      assets.push({
+        asset: currency,
+        balance: amount,
+        available_balance: free,
+        usd_price: price,
+        usd_value: usdValue,
+        usd_available: usdAvailable,
+      });
+    } catch (e) {
+      errors.push({ source: 'coinbase_price', code: currency, message: e?.message || `Could not price ${currency}` });
+    }
+  }
+
+  return {
+    total_balance: total,
+    available_balance: available,
+    unrealized_pnl: 0,
+    coinbase_balance: total,
+    coinbase_available_balance: available,
+    coinbase_assets: assets,
+    connected: true,
+    exchange: 'coinbase',
+    balance_sources_checked: ['coinbase_accounts'],
+    balance_source_errors: errors,
+    balance_error: total === 0 && errors.length === 0 ? 'No Coinbase balances found for this API key.' : '',
+  };
+}
+
 app.post('/api/exchange/test', requireUser, async (req, res) => {
   const { exchange_connection_id } = req.body;
   const { data: conn } = await supabase.from('exchange_connections').select('*')
@@ -695,6 +917,33 @@ app.post('/api/exchange/test', requireUser, async (req, res) => {
       return res.json({ connected: false, message: 'API key or secret is empty — please re-enter your credentials.' });
     }
 
+    if (conn.exchange_name === 'coinbase') {
+      const coinbaseCreds = getCoinbaseCredentials(conn);
+      if (!coinbaseCreds.keyName.startsWith('organizations/')) {
+        return res.json({
+          connected: false,
+          exchange: 'coinbase',
+          message: 'Coinbase API Key must be the full key name, like organizations/{org_id}/apiKeys/{key_id}. Do not use a Binance key or a short nickname.',
+        });
+      }
+      if (!coinbaseCreds.privateKey.includes('BEGIN EC PRIVATE KEY') && !coinbaseCreds.privateKey.includes('BEGIN PRIVATE KEY')) {
+        return res.json({
+          connected: false,
+          exchange: 'coinbase',
+          message: 'Coinbase Private Key must be the full ECDSA private key PEM, including BEGIN/END lines. Ed25519 keys are not supported for this API.',
+        });
+      }
+      const balance = await getCoinbaseBalance(conn);
+      await supabase.from('exchange_connections')
+        .update({ is_connected: true, is_verified_real: true, last_tested_at: new Date().toISOString() })
+        .eq('id', conn.id);
+      return res.json({
+        connected: true,
+        message: 'Connected to Coinbase Advanced Trade. Balance sync is active.',
+        balance: balance.total_balance,
+      });
+    }
+
     const ts    = Date.now();
     // recvWindow=10000 gives a 10s tolerance for clock skew between server and Binance
     const query = `timestamp=${ts}&recvWindow=10000`;
@@ -704,11 +953,11 @@ app.post('/api/exchange/test', requireUser, async (req, res) => {
       headers: { 'X-MBX-APIKEY': apiKey },
       signal: AbortSignal.timeout(10_000),
     });
-    const data = await response.json();
+    const data = await response.json().catch(() => ({}));
 
     // Binance returns -2015 for IP restriction and -2014 for bad key format
     const connected = response.ok && Array.isArray(data);
-    let message = connected ? 'Connected to Binance Futures' : (data?.msg || 'Connection failed');
+    let message = connected ? 'Connected to Binance Futures' : (data?.msg || `Binance returned HTTP ${response.status}`);
 
     // Translate opaque Binance errors into actionable messages
     const serverIp = await getServerPublicIp();
@@ -717,6 +966,8 @@ app.post('/api/exchange/test', requireUser, async (req, res) => {
         message = serverIp
           ? `IP not whitelisted. In Binance API Management → Edit Restrictions → add this IP to the whitelist: ${serverIp}`
           : "IP restriction error. Open Binance API Management → Edit Restrictions and add this server's public IP to the whitelist.";
+      } else if (response.status === 401) {
+        message = 'Binance rejected this API key request with HTTP 401. Check that the key/secret pair is correct, Futures permission is enabled, and any IP whitelist includes this server.';
       } else if (data?.code === -1021) {
         message = 'Timestamp error — server clock may be out of sync. Try again.';
       } else if (data?.code === -2011) {
@@ -728,12 +979,25 @@ app.post('/api/exchange/test', requireUser, async (req, res) => {
       .update({ is_connected: connected, is_verified_real: connected, last_tested_at: new Date().toISOString() })
       .eq('id', conn.id);
 
-    res.json({ connected, message, binance_code: data?.code || null, server_ip: serverIp });
+    res.json({ connected, message, binance_code: data?.code || null, http_status: response.status, server_ip: serverIp });
   } catch (e) {
-    const msg = e?.cause?.code === 'ECONNREFUSED'
+    let msg = e?.cause?.code === 'ECONNREFUSED'
       ? 'Cannot reach Binance — check your internet connection.'
       : (e.message || 'Connection error');
-    res.json({ connected: false, message: msg });
+    if (conn.exchange_name === 'coinbase' && e?.status === 401) {
+      const serverIp = await getServerPublicIp();
+      msg = serverIp
+        ? `Coinbase rejected the API credentials with HTTP 401. Confirm this public IP is allowed in the Coinbase key allowlist: ${serverIp}. Also confirm the key is a Coinbase App API key with ECDSA/ES256 and portfolio View permission.`
+        : 'Coinbase rejected the API credentials with HTTP 401. Confirm the key is a Coinbase App API key with ECDSA/ES256, portfolio View permission, and correct IP allowlist.';
+    }
+    res.json({
+      connected: false,
+      message: msg,
+      http_status: e?.status || null,
+      exchange: conn.exchange_name,
+      coinbase_error: conn.exchange_name === 'coinbase' ? (e?.data || null) : undefined,
+      coinbase_auth_debug: conn.exchange_name === 'coinbase' ? (e?.auth_debug || null) : undefined,
+    });
   }
 });
 
@@ -983,7 +1247,6 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
     .from('exchange_connections')
     .select('id, exchange_name, api_key, api_secret, is_connected, is_verified_real, created_at')
     .eq('user_id', req.user.id)
-    .eq('exchange_name', 'binance')
     .order('created_at', { ascending: false });
 
   if (connError) {
@@ -992,7 +1255,6 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
       .from('exchange_connections')
       .select('id, exchange_name, api_key, api_secret, is_connected, created_at')
       .eq('user_id', req.user.id)
-      .eq('exchange_name', 'binance')
       .order('created_at', { ascending: false });
     connections = fallback.data || [];
     connError = fallback.error;
@@ -1019,6 +1281,27 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
   }
 
   // Check cache first — avoids hammering exchange on every Dashboard render
+  if (conn.exchange_name === 'coinbase') {
+    try {
+      const result = await getCoinbaseBalance(conn);
+      return res.json({
+        ...result,
+        exchange_connection_id: conn.id,
+        api_key_preview: `${String(conn.api_key || '').slice(0, 12)}...`,
+      });
+    } catch (e) {
+      return res.json({
+        total_balance: 0,
+        available_balance: 0,
+        unrealized_pnl: 0,
+        connected: true,
+        exchange: 'coinbase',
+        balance_error: e?.message || 'Could not fetch Coinbase balance',
+        exchange_connection_id: conn.id,
+      });
+    }
+  }
+
   try {
     const apiKey = (conn.api_key || '').trim();
     const apiSecret = (conn.api_secret || '').trim();
@@ -1359,14 +1642,21 @@ app.post('/api/user/sync-trades', requireUser, async (req, res) => {
   // Don't gate on is_connected — IP restriction can mark it false even with valid keys
   const { data: conn } = await supabase
     .from('exchange_connections')
-    .select('api_key, api_secret')
+    .select('api_key, api_secret, exchange_name')
     .eq('user_id', req.user.id)
     .order('created_at', { ascending: true })
     .limit(1)
     .maybeSingle();
 
   if (!conn?.api_key) {
-    return res.status(400).json({ error: 'No exchange connection found. Add your Binance API keys in Settings.' });
+    return res.status(400).json({ error: 'No exchange connection found. Add exchange API keys in Settings.' });
+  }
+  if (conn.exchange_name === 'coinbase') {
+    return res.json({
+      success: true,
+      closed_phantom: 0,
+      message: 'Coinbase balance sync is active. Position sync is not enabled for Coinbase until live Coinbase futures execution is supported.',
+    });
   }
 
   try {
@@ -1381,15 +1671,22 @@ app.post('/api/user/sync-trades', requireUser, async (req, res) => {
 // Bot-facing sync (called by bot via bot token on startup)
 app.post('/api/bot/sync', requireBotToken, async (req, res) => {
   const bot = req.bot;
-  let apiKey = '', apiSecret = '';
+  let apiKey = '', apiSecret = '', exchangeName = 'binance';
   if (bot.exchange_id) {
     const { data: ex } = await supabase.from('exchange_connections')
-      .select('api_key, api_secret').eq('id', bot.exchange_id).single();
-    apiKey = ex?.api_key || ''; apiSecret = ex?.api_secret || '';
+      .select('api_key, api_secret, exchange_name').eq('id', bot.exchange_id).single();
+    apiKey = ex?.api_key || ''; apiSecret = ex?.api_secret || ''; exchangeName = ex?.exchange_name || 'binance';
   }
   if (!apiKey) return res.json({ success: true, message: 'No exchange credentials — skipping sync' });
 
   try {
+    if (exchangeName === 'coinbase') {
+      return res.json({
+        success: true,
+        closed_phantom: 0,
+        message: 'Coinbase position sync skipped; live Coinbase futures execution is not enabled.',
+      });
+    }
     const result = await syncTradesForUser(bot.user_id, apiKey, apiSecret);
     res.json({ success: true, ...result });
   } catch (e) {
@@ -1534,7 +1831,12 @@ app.put('/api/bots/:id/trading-mode', requireUser, async (req, res) => {
       });
     }
     const { data: conn } = await supabase.from('exchange_connections')
-      .select('is_verified_real').eq('id', bot.exchange_id).single();
+      .select('is_verified_real, exchange_name').eq('id', bot.exchange_id).single();
+    if (conn?.exchange_name === 'coinbase') {
+      return res.status(422).json({
+        error: 'Coinbase balance sync is supported, but live Coinbase order execution is not enabled yet. Use Binance for live mode.',
+      });
+    }
     if (!conn?.is_verified_real) {
       return res.status(422).json({
         error: 'Please connect and validate real Binance API keys before switching to live mode.',
