@@ -645,7 +645,7 @@ app.get('/api/bot/config/:bot_id', requireBotToken, async (req, res) => {
 
   res.json({
     bot_id: bot.id, bot_token: bot.bot_token, symbol: bot.trading_pair, timeframe: bot.timeframe,
-    leverage: bot.leverage || 5, min_confidence: bot.min_confidence || 68,
+    leverage: bot.leverage || 5, min_confidence: bot.min_confidence || 65,
     stop_loss_percent: bot.stop_loss_percent, take_profit_percent: bot.take_profit_percent,
     max_trades_per_day: bot.max_trades_per_day, trade_amount: bot.trade_amount,
     trade_amount_type: bot.trade_amount_type, daily_max_loss: bot.daily_max_loss,
@@ -841,7 +841,7 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
     daily_loss_limit:          Number(bot.daily_max_loss)     || 50,
     take_profit_pct:           Number(bot.take_profit_percent)|| 3.0,
     stop_loss_pct:             Number(bot.stop_loss_percent)  || 2.0,
-    base_confidence_threshold: Number(bot.min_confidence)     || 68,
+    base_confidence_threshold: Number(bot.min_confidence)     || 65,
     max_open_trades:           Number(bot.max_open_trades)    || 1,
     max_trades_per_day:        Number(bot.max_trades_per_day) || 5,
   }, null, 2));
