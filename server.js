@@ -668,6 +668,35 @@ app.get('/api/bot/config/:bot_id', requireBotToken, async (req, res) => {
  * 404 → bot hasn't signalled this symbol yet (frontend shows "waiting for bot")
  * 200 → response shape used by AITradingAssistant component
  */
+app.get('/api/bots/:id/logs', requireUser, async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 100, 300);
+  const since = typeof req.query.since === 'string' ? req.query.since : null;
+
+  const { data: bot, error: botErr } = await supabase
+    .from('bots')
+    .select('id')
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id)
+    .maybeSingle();
+
+  if (botErr) return res.status(500).json({ error: botErr.message });
+  if (!bot) return res.status(404).json({ error: 'Bot not found' });
+
+  let query = supabase
+    .from('bot_logs')
+    .select('id, bot_id, level, channel, message, logged_at')
+    .eq('bot_id', req.params.id)
+    .order('logged_at', { ascending: false })
+    .limit(limit);
+
+  if (since) query = query.gte('logged_at', since);
+
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+
+  res.json({ logs: (data || []).reverse() });
+});
+
 app.get('/api/market/analysis/:symbol', requireUser, async (req, res) => {
   // Accept both BTCUSDT and BTC/USDT
   const symbol = req.params.symbol.toUpperCase().replace('/', '');
@@ -861,6 +890,31 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
     windowsHide: true,
   });
   child.unref();  // fully decouple — bot keeps running if Node restarts
+
+  await supabase.from('bot_logs').insert({
+    bot_id: botId,
+    level: 'info',
+    channel: 'bot',
+    message: `[START] Bot process launch requested via ${pythonExe}`,
+    logged_at: new Date().toISOString(),
+  });
+
+  child.on('error', async (err) => {
+    console.error(`[BOT] Failed to start ${botId}:`, err);
+    await supabase.from('bots').update({
+      is_running: false,
+      lifecycle_status: 'requires_reconfiguration',
+      disabled_reason: `Bot process failed to start: ${err.message}`,
+      updated_at: new Date().toISOString(),
+    }).eq('id', botId);
+    await supabase.from('bot_logs').insert({
+      bot_id: botId,
+      level: 'error',
+      channel: 'bot',
+      message: `[START_FAILED] ${err.message}`,
+      logged_at: new Date().toISOString(),
+    });
+  });
 
   console.log(`[BOT] Started ${botId} (PID ${child.pid})`);
   res.json({ success: true, pid: child.pid, message: `Bot started (PID ${child.pid})` });
