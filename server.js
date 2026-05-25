@@ -772,6 +772,7 @@ app.get('/api/market/analysis/:symbol', requireUser, async (req, res) => {
 
 app.post('/api/bots/:id/start', requireUser, async (req, res) => {
   const { id: botId } = req.params;
+  try {
   const { data: bot, error } = await supabase.from('bots').select('*').eq('id', botId).eq('user_id', req.user.id).single();
   if (error || !bot) return res.status(404).json({ error: 'Bot not found' });
   if (bot.is_running) return res.json({ success: true, message: 'Already running' });
@@ -918,6 +919,25 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
 
   console.log(`[BOT] Started ${botId} (PID ${child.pid})`);
   res.json({ success: true, pid: child.pid, message: `Bot started (PID ${child.pid})` });
+  } catch (err) {
+    const message = err?.message || String(err);
+    console.error(`[BOT] Start route failed for ${botId}:`, err);
+    await supabase.from('bots').update({
+      is_running: false,
+      lifecycle_status: 'requires_reconfiguration',
+      requires_reconfiguration: true,
+      disabled_reason: `Bot start failed: ${message}`,
+      updated_at: new Date().toISOString(),
+    }).eq('id', botId).eq('user_id', req.user.id);
+    await supabase.from('bot_logs').insert({
+      bot_id: botId,
+      level: 'error',
+      channel: 'bot',
+      message: `[START_ROUTE_FAILED] ${message}`,
+      logged_at: new Date().toISOString(),
+    });
+    res.status(500).json({ error: `Bot start failed: ${message}` });
+  }
 });
 
 app.post('/api/bots/:id/stop', requireUser, async (req, res) => {
