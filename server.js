@@ -154,16 +154,240 @@ async function activatePaidSubscriptionFromCheckout(session) {
 // ── In-process balance cache (30s TTL) ───────────────────────────────────
 // Prevents hammering Binance Futures on every Dashboard load.
 // The balance endpoint is non-critical — stale by 30s is acceptable.
-const balanceCache = new Map(); // key = user_id → { data, expiresAt }
+const balanceCache = new Map(); // key = user_id:exchange_connection_id:fingerprint → { data, expiresAt }
 const BALANCE_TTL_MS = 30_000;
 
-function getCachedBalance(userId) {
-  const entry = balanceCache.get(userId);
+function balanceCacheKey(userId, conn) {
+  return `${userId}:${conn?.id || 'none'}:${conn?.account_fingerprint || 'unknown'}`;
+}
+function getCachedBalance(userId, conn) {
+  const entry = balanceCache.get(balanceCacheKey(userId, conn));
   if (entry && entry.expiresAt > Date.now()) return entry.data;
   return null;
 }
-function setCachedBalance(userId, data) {
-  balanceCache.set(userId, { data, expiresAt: Date.now() + BALANCE_TTL_MS });
+function setCachedBalance(userId, conn, data) {
+  balanceCache.set(balanceCacheKey(userId, conn), { data, expiresAt: Date.now() + BALANCE_TTL_MS });
+}
+function clearUserBalanceCache(userId) {
+  for (const key of balanceCache.keys()) {
+    if (key.startsWith(`${userId}:`)) balanceCache.delete(key);
+  }
+}
+
+function normalizeExchangeName(name) {
+  const value = String(name || 'binance').toLowerCase().trim();
+  return value === 'coinbase' ? 'coinbase' : 'binance';
+}
+
+function buildExchangeAccountFingerprint(exchangeName, apiKey) {
+  const exchange = normalizeExchangeName(exchangeName);
+  const identity = String(apiKey || '').trim();
+  if (!identity) return null;
+  return crypto.createHash('sha256').update(`${exchange}:${identity}`).digest('hex');
+}
+
+function getConnectionFingerprint(conn) {
+  if (!conn) return null;
+  return conn.account_fingerprint || buildExchangeAccountFingerprint(conn.exchange_name, conn.api_key);
+}
+
+async function recordExchangeAudit(userId, eventType, details = {}, exchangeConnectionId = null) {
+  try {
+    await supabase.from('exchange_audit_events').insert({
+      user_id: userId,
+      exchange_connection_id: exchangeConnectionId,
+      event_type: eventType,
+      details,
+    });
+  } catch (e) {
+    console.warn('[exchange_audit]', e?.message || e);
+  }
+}
+
+async function upsertActiveExchangeContext(userId, conn, reason = 'manual') {
+  const fingerprint = getConnectionFingerprint(conn);
+  const exchangeName = normalizeExchangeName(conn.exchange_name);
+
+  await supabase.from('exchange_connections')
+    .update({ is_active: false })
+    .eq('user_id', userId);
+
+  await supabase.from('exchange_connections')
+    .update({
+      is_active: true,
+      account_fingerprint: fingerprint,
+      lifecycle_status: conn.is_connected === false ? 'disconnected' : 'connected',
+    })
+    .eq('id', conn.id)
+    .eq('user_id', userId);
+
+  await supabase.from('user_exchange_context').upsert({
+    user_id: userId,
+    active_exchange_connection_id: conn.id,
+    active_exchange_name: exchangeName,
+    active_account_fingerprint: fingerprint,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'user_id' });
+
+  const { data: bots } = await supabase.from('bots')
+    .select('id, exchange_id, exchange_account_fingerprint, is_running')
+    .eq('user_id', userId);
+
+  const { data: userConnections } = await supabase.from('exchange_connections')
+    .select('id')
+    .eq('user_id', userId);
+  const knownConnectionIds = new Set((userConnections || []).map(row => row.id));
+
+  const compatibleIds = (bots || [])
+    .filter(bot => {
+      const sameConnection = bot.exchange_id === conn.id;
+      const sameFingerprint = fingerprint && bot.exchange_account_fingerprint === fingerprint;
+      const unversionedCurrentConnection = sameConnection && !bot.exchange_account_fingerprint;
+      const legacyOrphanBinanceBot =
+        exchangeName === 'binance' &&
+        bot.exchange_id &&
+        !knownConnectionIds.has(bot.exchange_id) &&
+        !bot.exchange_account_fingerprint;
+
+      return sameConnection || sameFingerprint || unversionedCurrentConnection || legacyOrphanBinanceBot;
+    })
+    .map(bot => bot.id);
+
+  const incompatibleIds = (bots || [])
+    .filter(bot => bot.exchange_id && !compatibleIds.includes(bot.id))
+    .map(bot => bot.id);
+
+  if (compatibleIds.length > 0) {
+    await supabase.from('bots').update({
+      exchange_id: conn.id,
+      exchange_account_fingerprint: fingerprint,
+      lifecycle_status: 'active',
+      requires_reconfiguration: false,
+      disabled_reason: null,
+      updated_at: new Date().toISOString(),
+    }).in('id', compatibleIds);
+  }
+
+  if (incompatibleIds.length > 0) {
+    await supabase.from('bots').update({
+      is_running: false,
+      lifecycle_status: 'requires_reconfiguration',
+      requires_reconfiguration: true,
+      disabled_reason: reason === 'credentials_changed'
+        ? 'API keys changed for this exchange account.'
+        : 'Bot belongs to a different exchange/account context.',
+      updated_at: new Date().toISOString(),
+    }).in('id', incompatibleIds);
+  }
+
+  clearUserBalanceCache(userId);
+  await recordExchangeAudit(userId, 'active_exchange_changed', {
+    reason,
+    exchange_name: exchangeName,
+    account_fingerprint: fingerprint,
+    compatible_bot_count: compatibleIds.length,
+    incompatible_bot_count: incompatibleIds.length,
+  }, conn.id);
+
+  return {
+    connection: { ...conn, exchange_name: exchangeName, account_fingerprint: fingerprint, is_active: true },
+    recovered_bot_count: compatibleIds.length,
+    disabled_bot_count: incompatibleIds.length,
+  };
+}
+
+async function getActiveExchangeContext(userId, { allowFallback = true } = {}) {
+  const { data: context } = await supabase.from('user_exchange_context')
+    .select('active_exchange_connection_id, active_exchange_name, active_account_fingerprint, updated_at')
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  if (context?.active_exchange_connection_id) {
+    const { data: conn } = await supabase.from('exchange_connections')
+      .select('*')
+      .eq('id', context.active_exchange_connection_id)
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (conn) {
+      const fingerprint = getConnectionFingerprint(conn);
+      if (!conn.account_fingerprint && fingerprint) {
+        await supabase.from('exchange_connections')
+          .update({ account_fingerprint: fingerprint })
+          .eq('id', conn.id);
+      }
+      return {
+        context,
+        connection: { ...conn, account_fingerprint: fingerprint },
+      };
+    }
+  }
+
+  if (!allowFallback) return { context: null, connection: null };
+
+  const { data: conns } = await supabase.from('exchange_connections')
+    .select('*')
+    .eq('user_id', userId)
+    .order('is_active', { ascending: false })
+    .order('is_verified_real', { ascending: false })
+    .order('is_connected', { ascending: false })
+    .order('created_at', { ascending: false });
+
+  const fallback = (conns || []).find(c => c.api_key && c.api_secret) || null;
+  if (!fallback) return { context: null, connection: null };
+  const result = await upsertActiveExchangeContext(userId, fallback, 'fallback');
+  return {
+    context: {
+      active_exchange_connection_id: result.connection.id,
+      active_exchange_name: result.connection.exchange_name,
+      active_account_fingerprint: result.connection.account_fingerprint,
+    },
+    connection: result.connection,
+  };
+}
+
+async function assertBotMatchesActiveExchange(userId, bot) {
+  const { connection } = await getActiveExchangeContext(userId);
+  if (!connection) {
+    return { ok: false, status: 422, error: 'No active exchange selected. Connect and activate an exchange first.' };
+  }
+  if (!bot.exchange_id) {
+    return { ok: false, status: 422, error: 'This bot is not assigned to the active exchange. Reconfigure it before starting.' };
+  }
+  const activeFingerprint = getConnectionFingerprint(connection);
+  const botFingerprint = bot.exchange_account_fingerprint || null;
+  const sameAccount = activeFingerprint && botFingerprint === activeFingerprint;
+  if (bot.exchange_id !== connection.id && sameAccount) {
+    await supabase.from('bots').update({
+      exchange_id: connection.id,
+      lifecycle_status: 'active',
+      requires_reconfiguration: false,
+      disabled_reason: null,
+      updated_at: new Date().toISOString(),
+    }).eq('id', bot.id);
+    bot.exchange_id = connection.id;
+  }
+  if (bot.exchange_id !== connection.id || (botFingerprint && botFingerprint !== activeFingerprint)) {
+    await supabase.from('bots').update({
+      is_running: false,
+      lifecycle_status: 'requires_reconfiguration',
+      requires_reconfiguration: true,
+      disabled_reason: 'Bot exchange/account does not match the active exchange.',
+      updated_at: new Date().toISOString(),
+    }).eq('id', bot.id);
+    return { ok: false, status: 409, error: 'This bot belongs to a different exchange/account. Reconfigure it for the active exchange before starting.' };
+  }
+  if (bot.lifecycle_status && !['active', 'stopped'].includes(bot.lifecycle_status) && bot.requires_reconfiguration) {
+    return { ok: false, status: 409, error: `This bot status is "${bot.lifecycle_status}" and requires reconfiguration.` };
+  }
+  if (!botFingerprint) {
+    await supabase.from('bots').update({
+      exchange_account_fingerprint: activeFingerprint,
+      lifecycle_status: 'active',
+      requires_reconfiguration: false,
+      disabled_reason: null,
+    }).eq('id', bot.id);
+  }
+  return { ok: true, connection: { ...connection, account_fingerprint: activeFingerprint } };
 }
 
 // ── Suppress repeated fetch-timeout console noise ────────────────────────
@@ -297,6 +521,23 @@ async function requireAdmin(req, res, next) {
 app.post('/api/bot/heartbeat', requireBotToken, async (req, res) => {
   const commands = [];
   if (!req.bot.is_running) commands.push({ command: 'stop', close_open_trades: true });
+  if (req.bot.exchange_id) {
+    const active = await getActiveExchangeContext(req.bot.user_id, { allowFallback: false });
+    const activeConn = active.connection;
+    const activeFingerprint = activeConn ? getConnectionFingerprint(activeConn) : null;
+    if (!activeConn || req.bot.exchange_id !== activeConn.id ||
+        (req.bot.exchange_account_fingerprint && req.bot.exchange_account_fingerprint !== activeFingerprint) ||
+        req.bot.requires_reconfiguration) {
+      commands.push({ command: 'stop', close_open_trades: true, reason: 'exchange_context_changed' });
+      await supabase.from('bots').update({
+        is_running: false,
+        lifecycle_status: 'requires_reconfiguration',
+        requires_reconfiguration: true,
+        disabled_reason: 'Active exchange/account changed while bot was running.',
+        updated_at: new Date().toISOString(),
+      }).eq('id', req.bot.id);
+    }
+  }
   res.json({ success: true, commands });
 });
 
@@ -305,14 +546,19 @@ app.post('/api/bot/trade/open', requireBotToken, async (req, res) => {
   const { symbol, side, entry_price, quantity, leverage, tp_price, sl_price,
           confidence, signal_type, regime, order_id, opened_at } = req.body;
   let exchangeName = 'binance';
+  let exchangeConnectionId = bot.exchange_id || null;
+  let exchangeFingerprint = bot.exchange_account_fingerprint || null;
   if (bot.exchange_id) {
     const { data: ex } = await supabase.from('exchange_connections')
-      .select('exchange_name').eq('id', bot.exchange_id).maybeSingle();
+      .select('exchange_name, account_fingerprint').eq('id', bot.exchange_id).maybeSingle();
     exchangeName = ex?.exchange_name || 'binance';
+    exchangeFingerprint = exchangeFingerprint || ex?.account_fingerprint || null;
   }
 
   const { data: trade, error } = await supabase.from('trades').insert({
     bot_id: bot.id, user_id: bot.user_id, exchange_name: exchangeName,
+    exchange_connection_id: exchangeConnectionId,
+    exchange_account_fingerprint: exchangeFingerprint,
     trading_pair: symbol, trade_type: side === 'long' ? 'long' : 'short',
     entry_price, quantity, leverage: leverage || 5, tp_price, sl_price,
     confidence, signal_type, regime, order_id, status: 'open',
@@ -385,6 +631,11 @@ app.post('/api/bot/status', requireBotToken, async (req, res) => {
 app.get('/api/bot/config/:bot_id', requireBotToken, async (req, res) => {
   const bot = req.bot;
   if (bot.id !== req.params.bot_id) return res.status(403).json({ error: 'Token mismatch' });
+
+  if (bot.exchange_id) {
+    const validation = await assertBotMatchesActiveExchange(bot.user_id, bot);
+    if (!validation.ok) return res.status(validation.status).json({ error: validation.error });
+  }
 
   let apiKey = '', apiSecret = '', exchangeName = 'binance';
   if (bot.exchange_id) {
@@ -500,12 +751,15 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
   if (!sub) return res.status(402).json({ error: 'No paid active subscription. Complete payment before starting bots.' });
   if (sub.remaining_trades <= 0) return res.status(402).json({ error: 'No remaining trades in your plan.' });
 
+  const validation = await assertBotMatchesActiveExchange(req.user.id, bot);
+  if (!validation.ok) return res.status(validation.status).json({ error: validation.error });
+
   // Fetch exchange API keys if a connection is linked
-  let apiKey = '', apiSecret = '', exchangeName = 'binance';
+  let apiKey = '', apiSecret = '', exchangeName = 'binance', exchangeFingerprint = null;
   if (bot.exchange_id) {
     const { data: ex } = await supabase
       .from('exchange_connections')
-      .select('api_key, api_secret, exchange_name')
+      .select('api_key, api_secret, exchange_name, account_fingerprint')
       .eq('id', bot.exchange_id)
       .single();
     apiKey    = (ex?.api_key    || '').trim();
@@ -513,6 +767,7 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
       ? String(ex?.api_secret || '').trim()
       : (ex?.api_secret || '').trim();
     exchangeName = ex?.exchange_name || 'binance';
+    exchangeFingerprint = ex?.account_fingerprint || buildExchangeAccountFingerprint(exchangeName, apiKey);
   }
 
   if ((bot.trading_mode || 'paper') === 'live') {
@@ -532,7 +787,15 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
   }
 
   const botToken = crypto.randomBytes(32).toString('hex');
-  await supabase.from('bots').update({ bot_token: botToken, is_running: true, updated_at: new Date().toISOString() }).eq('id', botId);
+  await supabase.from('bots').update({
+    bot_token: botToken,
+    is_running: true,
+    lifecycle_status: 'active',
+    requires_reconfiguration: false,
+    disabled_reason: null,
+    exchange_account_fingerprint: exchangeFingerprint || bot.exchange_account_fingerprint || null,
+    updated_at: new Date().toISOString(),
+  }).eq('id', botId);
 
   const configDir  = process.env.BOT_CONFIG_DIR || path.join(__dirname, '../AITradingBot/bot_configs');
   fs.mkdirSync(configDir, { recursive: true });
@@ -904,6 +1167,65 @@ async function getCoinbaseBalance(conn) {
   };
 }
 
+app.get('/api/exchange/active', requireUser, async (req, res) => {
+  let { connection, context } = await getActiveExchangeContext(req.user.id);
+  let repair = null;
+  if (connection) {
+    repair = await upsertActiveExchangeContext(req.user.id, connection, 'context_refresh');
+    ({ connection, context } = await getActiveExchangeContext(req.user.id));
+  }
+  const { data: exchanges } = await supabase.from('exchange_connections')
+    .select('id, exchange_name, is_connected, is_verified_real, is_active, lifecycle_status, account_fingerprint, account_label, last_tested_at, created_at')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false });
+
+  res.json({
+    active: connection ? {
+      id: connection.id,
+      exchange_name: normalizeExchangeName(connection.exchange_name),
+      is_connected: !!connection.is_connected,
+      is_verified_real: !!connection.is_verified_real,
+      lifecycle_status: connection.lifecycle_status || 'connected',
+      account_fingerprint: connection.account_fingerprint,
+      account_label: connection.account_label || null,
+      last_tested_at: connection.last_tested_at || null,
+    } : null,
+    context,
+    repair: repair ? {
+      recovered_bot_count: repair.recovered_bot_count || 0,
+      disabled_bot_count: repair.disabled_bot_count || 0,
+    } : null,
+    exchanges: exchanges || [],
+  });
+});
+
+app.put('/api/exchange/active', requireUser, async (req, res) => {
+  const { exchange_connection_id } = req.body || {};
+  if (!exchange_connection_id) return res.status(400).json({ error: 'exchange_connection_id is required' });
+
+  const { data: conn, error } = await supabase.from('exchange_connections')
+    .select('*')
+    .eq('id', exchange_connection_id)
+    .eq('user_id', req.user.id)
+    .maybeSingle();
+  if (error || !conn) return res.status(404).json({ error: 'Exchange connection not found' });
+  if (!conn.api_key || !conn.api_secret) return res.status(422).json({ error: 'Exchange credentials are missing.' });
+
+  const result = await upsertActiveExchangeContext(req.user.id, conn, 'manual');
+  res.json({
+    success: true,
+    active: {
+      id: result.connection.id,
+      exchange_name: result.connection.exchange_name,
+      account_fingerprint: result.connection.account_fingerprint,
+    },
+    disabled_bot_count: result.disabled_bot_count,
+    message: result.disabled_bot_count > 0
+      ? `${result.disabled_bot_count} bot(s) require reconfiguration because they belong to another exchange/account.`
+      : 'Active exchange updated.',
+  });
+});
+
 app.post('/api/exchange/test', requireUser, async (req, res) => {
   const { exchange_connection_id } = req.body;
   const { data: conn } = await supabase.from('exchange_connections').select('*')
@@ -918,6 +1240,8 @@ app.post('/api/exchange/test', requireUser, async (req, res) => {
     }
 
     if (conn.exchange_name === 'coinbase') {
+      const nextFingerprint = buildExchangeAccountFingerprint('coinbase', apiKey);
+      const previousFingerprint = conn.account_fingerprint || null;
       const coinbaseCreds = getCoinbaseCredentials(conn);
       if (!coinbaseCreds.keyName.startsWith('organizations/')) {
         return res.json({
@@ -935,8 +1259,26 @@ app.post('/api/exchange/test', requireUser, async (req, res) => {
       }
       const balance = await getCoinbaseBalance(conn);
       await supabase.from('exchange_connections')
-        .update({ is_connected: true, is_verified_real: true, last_tested_at: new Date().toISOString() })
+        .update({
+          is_connected: true,
+          is_verified_real: true,
+          lifecycle_status: 'connected',
+          account_fingerprint: nextFingerprint,
+          credentials_version: previousFingerprint && previousFingerprint !== nextFingerprint
+            ? Number(conn.credentials_version || 1) + 1
+            : Number(conn.credentials_version || 1),
+          credentials_changed_at: previousFingerprint && previousFingerprint !== nextFingerprint
+            ? new Date().toISOString()
+            : conn.credentials_changed_at,
+          last_tested_at: new Date().toISOString(),
+        })
         .eq('id', conn.id);
+      if (previousFingerprint && previousFingerprint !== nextFingerprint) {
+        await upsertActiveExchangeContext(req.user.id, { ...conn, account_fingerprint: nextFingerprint, is_connected: true, is_verified_real: true }, 'credentials_changed');
+      } else {
+        const { connection: active } = await getActiveExchangeContext(req.user.id, { allowFallback: false });
+        if (!active) await upsertActiveExchangeContext(req.user.id, { ...conn, account_fingerprint: nextFingerprint, is_connected: true, is_verified_real: true }, 'first_connection');
+      }
       return res.json({
         connected: true,
         message: 'Connected to Coinbase Advanced Trade. Balance sync is active.',
@@ -944,6 +1286,8 @@ app.post('/api/exchange/test', requireUser, async (req, res) => {
       });
     }
 
+    const nextFingerprint = buildExchangeAccountFingerprint('binance', apiKey);
+    const previousFingerprint = conn.account_fingerprint || null;
     const ts    = Date.now();
     // recvWindow=10000 gives a 10s tolerance for clock skew between server and Binance
     const query = `timestamp=${ts}&recvWindow=10000`;
@@ -976,8 +1320,28 @@ app.post('/api/exchange/test', requireUser, async (req, res) => {
     }
 
     await supabase.from('exchange_connections')
-      .update({ is_connected: connected, is_verified_real: connected, last_tested_at: new Date().toISOString() })
+      .update({
+        is_connected: connected,
+        is_verified_real: connected,
+        lifecycle_status: connected ? 'connected' : 'disconnected',
+        account_fingerprint: nextFingerprint,
+        credentials_version: previousFingerprint && previousFingerprint !== nextFingerprint
+          ? Number(conn.credentials_version || 1) + 1
+          : Number(conn.credentials_version || 1),
+        credentials_changed_at: previousFingerprint && previousFingerprint !== nextFingerprint
+          ? new Date().toISOString()
+          : conn.credentials_changed_at,
+        last_tested_at: new Date().toISOString(),
+      })
       .eq('id', conn.id);
+    if (connected) {
+      if (previousFingerprint && previousFingerprint !== nextFingerprint) {
+        await upsertActiveExchangeContext(req.user.id, { ...conn, account_fingerprint: nextFingerprint, is_connected: true, is_verified_real: true }, 'credentials_changed');
+      } else {
+        const { connection: active } = await getActiveExchangeContext(req.user.id, { allowFallback: false });
+        if (!active) await upsertActiveExchangeContext(req.user.id, { ...conn, account_fingerprint: nextFingerprint, is_connected: true, is_verified_real: true }, 'first_connection');
+      }
+    }
 
     res.json({ connected, message, binance_code: data?.code || null, http_status: response.status, server_ip: serverIp });
   } catch (e) {
@@ -1100,12 +1464,15 @@ app.post('/api/admin/subscriptions/grant', requireUser, requireAdmin, async (req
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/user/open-pnl', requireUser, async (req, res) => {
+  const { connection: activeConn } = await getActiveExchangeContext(req.user.id);
   // 1. Get all open trades for this user
-  const { data: openTrades } = await supabase
+  let openQuery = supabase
     .from('trades')
     .select('id, bot_id, trading_pair, trade_type, entry_price, quantity, leverage, tp_price, sl_price, opened_at')
     .eq('user_id', req.user.id)
     .eq('status', 'open');
+  if (activeConn?.id) openQuery = openQuery.eq('exchange_connection_id', activeConn.id);
+  const { data: openTrades } = await openQuery;
 
   if (!openTrades || openTrades.length === 0) {
     return res.json({ trades: [] });
@@ -1243,37 +1610,7 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
   // Get the first exchange for this user — do NOT filter by is_connected.
   // is_connected can be false due to IP restriction during the test, even
   // though keys are saved and Binance accepts them. Always try to fetch.
-  let { data: connections, error: connError } = await supabase
-    .from('exchange_connections')
-    .select('id, exchange_name, api_key, api_secret, is_connected, is_verified_real, created_at')
-    .eq('user_id', req.user.id)
-    .order('created_at', { ascending: false });
-
-  if (connError) {
-    console.warn(`[BALANCE] primary connection query failed: ${connError.message}`);
-    const fallback = await supabase
-      .from('exchange_connections')
-      .select('id, exchange_name, api_key, api_secret, is_connected, created_at')
-      .eq('user_id', req.user.id)
-      .order('created_at', { ascending: false });
-    connections = fallback.data || [];
-    connError = fallback.error;
-  }
-
-  if (connError) {
-    return res.status(500).json({
-      total_balance: 0,
-      available_balance: 0,
-      unrealized_pnl: 0,
-      connected: false,
-      error: connError.message || 'Could not load exchange connection',
-    });
-  }
-
-  const conn = (connections || []).sort((a, b) => {
-    const score = (row) => (row.is_verified_real ? 2 : 0) + (row.is_connected ? 1 : 0);
-    return score(b) - score(a);
-  })[0];
+  const { connection: conn } = await getActiveExchangeContext(req.user.id);
 
   if (!conn || !conn.api_key || !conn.api_secret) {
     // No exchange connected — return zeros gracefully
@@ -1525,13 +1862,15 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
 //   - Safe to call multiple times (idempotent)
 // ══════════════════════════════════════════════════════════════════════════════
 
-async function syncTradesForUser(userId, apiKey, apiSecret) {
+async function syncTradesForUser(userId, apiKey, apiSecret, exchangeConnectionId = null) {
   // 1. Get all open trades for this user
-  const { data: openTrades } = await supabase
+  let openQuery = supabase
     .from('trades')
     .select('id, bot_id, trading_pair, trade_type, entry_price, tp_price, sl_price, opened_at')
     .eq('user_id', userId)
     .eq('status', 'open');
+  if (exchangeConnectionId) openQuery = openQuery.eq('exchange_connection_id', exchangeConnectionId);
+  const { data: openTrades } = await openQuery;
 
   if (!openTrades || openTrades.length === 0) {
     return { synced: 0, closed_phantom: 0, message: 'No open trades to sync' };
@@ -1640,13 +1979,7 @@ async function syncTradesForUser(userId, apiKey, apiSecret) {
 // User-facing sync (called from Bots page "Sync" button)
 app.post('/api/user/sync-trades', requireUser, async (req, res) => {
   // Don't gate on is_connected — IP restriction can mark it false even with valid keys
-  const { data: conn } = await supabase
-    .from('exchange_connections')
-    .select('api_key, api_secret, exchange_name')
-    .eq('user_id', req.user.id)
-    .order('created_at', { ascending: true })
-    .limit(1)
-    .maybeSingle();
+  const { connection: conn } = await getActiveExchangeContext(req.user.id);
 
   if (!conn?.api_key) {
     return res.status(400).json({ error: 'No exchange connection found. Add exchange API keys in Settings.' });
@@ -1660,7 +1993,7 @@ app.post('/api/user/sync-trades', requireUser, async (req, res) => {
   }
 
   try {
-    const result = await syncTradesForUser(req.user.id, conn.api_key, conn.api_secret);
+    const result = await syncTradesForUser(req.user.id, conn.api_key, conn.api_secret, conn.id);
     res.json({ success: true, ...result });
   } catch (e) {
     console.error('[sync]', e);
@@ -1687,7 +2020,7 @@ app.post('/api/bot/sync', requireBotToken, async (req, res) => {
         message: 'Coinbase position sync skipped; live Coinbase futures execution is not enabled.',
       });
     }
-    const result = await syncTradesForUser(bot.user_id, apiKey, apiSecret);
+    const result = await syncTradesForUser(bot.user_id, apiKey, apiSecret, bot.exchange_id || null);
     res.json({ success: true, ...result });
   } catch (e) {
     res.status(500).json({ error: e.message });
