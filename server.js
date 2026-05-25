@@ -894,10 +894,20 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
   const stdoutFd = fs.openSync(stdoutPath, 'a');
   const stderrFd = fs.openSync(stderrPath, 'a');
 
+  const botEnv = {
+    ...process.env,
+    OPENBLAS_NUM_THREADS: process.env.OPENBLAS_NUM_THREADS || '1',
+    OMP_NUM_THREADS: process.env.OMP_NUM_THREADS || '1',
+    MKL_NUM_THREADS: process.env.MKL_NUM_THREADS || '1',
+    NUMEXPR_NUM_THREADS: process.env.NUMEXPR_NUM_THREADS || '1',
+    VECLIB_MAXIMUM_THREADS: process.env.VECLIB_MAXIMUM_THREADS || '1',
+  };
+
   const child = spawn(pythonExe, [botScript, '--config', configPath], {
     detached:    true,
     stdio:       ['ignore', stdoutFd, stderrFd],
     cwd:         path.dirname(botScript),
+    env:         botEnv,
     // windowsHide suppresses the CMD console window on Windows.
     // Python.exe is a console-subsystem app so spawn() shows a window by default.
     // This flag sets STARTF_USESHOWWINDOW + SW_HIDE in the Win32 STARTUPINFO struct.
