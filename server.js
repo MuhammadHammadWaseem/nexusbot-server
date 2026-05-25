@@ -880,9 +880,23 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
   const botScript = process.env.BOT_SCRIPT   ||
     path.join(__dirname, '../AITradingBot/scripts/run_bot_managed.py');
 
+  if (!fs.existsSync(botScript)) {
+    throw new Error(`BOT_SCRIPT not found: ${botScript}`);
+  }
+  if (path.isAbsolute(pythonExe) && !fs.existsSync(pythonExe)) {
+    throw new Error(`PYTHON_EXE not found: ${pythonExe}`);
+  }
+
+  const stdioLogDir = process.env.BOT_STDIO_LOG_DIR || path.join(configDir, 'process_logs');
+  fs.mkdirSync(stdioLogDir, { recursive: true });
+  const stdoutPath = path.join(stdioLogDir, `bot_${botId}.out.log`);
+  const stderrPath = path.join(stdioLogDir, `bot_${botId}.err.log`);
+  const stdoutFd = fs.openSync(stdoutPath, 'a');
+  const stderrFd = fs.openSync(stderrPath, 'a');
+
   const child = spawn(pythonExe, [botScript, '--config', configPath], {
     detached:    true,
-    stdio:       'ignore',
+    stdio:       ['ignore', stdoutFd, stderrFd],
     cwd:         path.dirname(botScript),
     // windowsHide suppresses the CMD console window on Windows.
     // Python.exe is a console-subsystem app so spawn() shows a window by default.
@@ -892,11 +906,14 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
   });
   child.unref();  // fully decouple — bot keeps running if Node restarts
 
+  fs.closeSync(stdoutFd);
+  fs.closeSync(stderrFd);
+
   await supabase.from('bot_logs').insert({
     bot_id: botId,
     level: 'info',
     channel: 'bot',
-    message: `[START] Bot process launch requested via ${pythonExe}`,
+    message: `[START] Bot process launch requested via ${pythonExe}. stdout: ${stdoutPath} stderr: ${stderrPath}`,
     logged_at: new Date().toISOString(),
   });
 
