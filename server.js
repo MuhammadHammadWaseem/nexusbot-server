@@ -376,6 +376,16 @@ async function assertBotMatchesActiveExchange(userId, bot) {
     }).eq('id', bot.id);
     return { ok: false, status: 409, error: 'This bot belongs to a different exchange/account. Reconfigure it for the active exchange before starting.' };
   }
+  if ((bot.timeframe || '5m') !== '5m') {
+    await supabase.from('bots').update({
+      is_running: false,
+      lifecycle_status: 'requires_reconfiguration',
+      requires_reconfiguration: true,
+      disabled_reason: 'Unsupported timeframe. Current production model is trained only on 5m candles with 1h context.',
+      updated_at: new Date().toISOString(),
+    }).eq('id', bot.id);
+    return { ok: false, status: 409, error: 'Unsupported timeframe. Reconfigure this bot to 5m before starting.' };
+  }
   if (bot.lifecycle_status && !['active', 'stopped'].includes(bot.lifecycle_status) && bot.requires_reconfiguration) {
     return { ok: false, status: 409, error: `This bot status is "${bot.lifecycle_status}" and requires reconfiguration.` };
   }
@@ -631,6 +641,12 @@ app.post('/api/bot/status', requireBotToken, async (req, res) => {
 app.get('/api/bot/config/:bot_id', requireBotToken, async (req, res) => {
   const bot = req.bot;
   if (bot.id !== req.params.bot_id) return res.status(403).json({ error: 'Token mismatch' });
+
+  if ((bot.timeframe || '5m') !== '5m') {
+    return res.status(409).json({
+      error: 'Unsupported bot timeframe. Current production model is trained only on 5m candles with 1h context. Reconfigure this bot to 5m.',
+    });
+  }
 
   if (bot.exchange_id) {
     const validation = await assertBotMatchesActiveExchange(bot.user_id, bot);
