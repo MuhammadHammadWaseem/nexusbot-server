@@ -504,7 +504,12 @@ async function requireBotToken(req, res, next) {
   const { data: bot, error } = await supabase.from('bots').select('*').eq('bot_token', token).maybeSingle();
   if (error || !bot) return res.status(401).json({ error: 'Invalid bot token' });
   req.bot = bot;
+  req.botRunId = req.headers['x-bot-run-id'] || req.body?.bot_run_id || null;
   next();
+}
+
+function isStaleBotRun(req) {
+  return Boolean(req.bot?.active_run_id && req.botRunId && req.bot.active_run_id !== req.botRunId);
 }
 
 async function requireUser(req, res, next) {
@@ -530,6 +535,9 @@ async function requireAdmin(req, res, next) {
 
 app.post('/api/bot/heartbeat', requireBotToken, async (req, res) => {
   const commands = [];
+  if (isStaleBotRun(req)) {
+    return res.json({ success: true, commands: [{ command: 'stop', close_open_trades: false, reason: 'stale_bot_run' }] });
+  }
   if (!req.bot.is_running) commands.push({ command: 'stop', close_open_trades: true });
   if (req.bot.exchange_id) {
     const active = await getActiveExchangeContext(req.bot.user_id, { allowFallback: false });
@@ -552,6 +560,7 @@ app.post('/api/bot/heartbeat', requireBotToken, async (req, res) => {
 });
 
 app.post('/api/bot/trade/open', requireBotToken, async (req, res) => {
+  if (isStaleBotRun(req)) return res.status(409).json({ success: false, error: 'Stale bot run' });
   const bot = req.bot;
   const { symbol, side, entry_price, quantity, leverage, tp_price, sl_price,
           confidence, signal_type, regime, order_id, opened_at } = req.body;
@@ -569,6 +578,7 @@ app.post('/api/bot/trade/open', requireBotToken, async (req, res) => {
     bot_id: bot.id, user_id: bot.user_id, exchange_name: exchangeName,
     exchange_connection_id: exchangeConnectionId,
     exchange_account_fingerprint: exchangeFingerprint,
+    market_type: bot.market_type || 'futures',
     trading_pair: symbol, trade_type: side === 'long' ? 'long' : 'short',
     entry_price, quantity, leverage: leverage || 5, tp_price, sl_price,
     confidence, signal_type, regime, order_id, status: 'open',
@@ -582,6 +592,7 @@ app.post('/api/bot/trade/open', requireBotToken, async (req, res) => {
 });
 
 app.post('/api/bot/trade/close', requireBotToken, async (req, res) => {
+  if (isStaleBotRun(req)) return res.status(409).json({ success: false, error: 'Stale bot run' });
   const bot = req.bot;
   const { trade_id, exit_price, pnl_usdt, pnl_r, exit_reason, bars_held, fee_usdt, net_pnl, closed_at } = req.body;
   if (!trade_id) return res.status(400).json({ success: false, error: 'trade_id required' });
@@ -602,6 +613,7 @@ app.post('/api/bot/trade/close', requireBotToken, async (req, res) => {
 });
 
 app.post('/api/bot/signal', requireBotToken, async (req, res) => {
+  if (isStaleBotRun(req)) return res.status(409).json({ success: false, error: 'Stale bot run' });
   const { symbol, signal, confidence, signal_type, regime, adx, atr_ratio,
           ema_long, ema_short, action_taken, price_at_signal, signaled_at } = req.body;
   await supabase.from('signals').insert({
@@ -613,6 +625,7 @@ app.post('/api/bot/signal', requireBotToken, async (req, res) => {
 });
 
 app.post('/api/bot/log/batch', requireBotToken, async (req, res) => {
+  if (isStaleBotRun(req)) return res.json({ success: true, ignored: true, reason: 'stale_bot_run' });
   const entries = req.body?.entries;
   if (!Array.isArray(entries) || entries.length === 0) return res.json({ success: true });
   await supabase.from('bot_logs').insert(entries.map(e => ({
@@ -624,6 +637,7 @@ app.post('/api/bot/log/batch', requireBotToken, async (req, res) => {
 });
 
 app.post('/api/bot/status', requireBotToken, async (req, res) => {
+  if (isStaleBotRun(req)) return res.json({ success: true, ignored: true, reason: 'stale_bot_run' });
   const { status, message } = req.body;
   // 'running' = true; stopped/error/anything else = false.
   // This fires on every bot lifecycle event including graceful exit and crashes.
@@ -661,7 +675,8 @@ app.get('/api/bot/config/:bot_id', requireBotToken, async (req, res) => {
 
   res.json({
     bot_id: bot.id, bot_token: bot.bot_token, symbol: bot.trading_pair, timeframe: bot.timeframe,
-    leverage: bot.leverage || 5, min_confidence: bot.min_confidence || 65,
+    market_type: bot.market_type || 'futures',
+    leverage: (bot.market_type || 'futures') === 'spot' ? 1 : (bot.leverage || 5), min_confidence: bot.min_confidence || 65,
     stop_loss_percent: bot.stop_loss_percent, take_profit_percent: bot.take_profit_percent,
     max_trades_per_day: bot.max_trades_per_day, trade_amount: bot.trade_amount,
     trade_amount_type: bot.trade_amount_type, daily_max_loss: bot.daily_max_loss,
@@ -792,6 +807,7 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
   const { data: bot, error } = await supabase.from('bots').select('*').eq('id', botId).eq('user_id', req.user.id).single();
   if (error || !bot) return res.status(404).json({ error: 'Bot not found' });
   if (bot.is_running) return res.json({ success: true, message: 'Already running' });
+  const marketType = String(bot.market_type || 'futures').toLowerCase() === 'spot' ? 'spot' : 'futures';
 
   const sub = await getActivePaidSubscription(req.user.id);
   if (!sub) return res.status(402).json({ error: 'No paid active subscription. Complete payment before starting bots.' });
@@ -832,9 +848,11 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
     }
   }
 
-  const botToken = crypto.randomBytes(32).toString('hex');
+  const botToken = bot.bot_token || crypto.randomBytes(32).toString('hex');
+  const botRunId = crypto.randomBytes(16).toString('hex');
   await supabase.from('bots').update({
     bot_token: botToken,
+    active_run_id: botRunId,
     is_running: true,
     lifecycle_status: 'active',
     requires_reconfiguration: false,
@@ -859,6 +877,7 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
     // Identity
     bot_id:     botId,
     bot_token:  botToken,
+    bot_run_id: botRunId,
     // Reporter URL — bot reads config["laravel_api_url"] to build endpoint URLs
     // BOT_API_URL: the URL the Python bot uses to call this Node server.
     // The bot runs on the SAME VPS — always use 127.0.0.1, never the public domain.
@@ -868,7 +887,8 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
     // Trading params
     symbol:     bot.trading_pair,
     timeframe:  bot.timeframe,
-    leverage:   bot.leverage    || 5,
+    market_type: marketType,
+    leverage:   marketType === 'spot' ? 1 : (bot.leverage || 5),
     // Exchange credentials
     api_key:      apiKey,
     api_secret:   apiSecret,
@@ -884,6 +904,7 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
     risk_per_trade:            (bot.trade_amount_type === 'percent')
                                  ? Number(bot.trade_amount)   // already a %
                                  : (Number(bot.trade_amount) / Number(bot.paper_balance || 10000)) * 100,
+    trade_amount_usdt:         Number(bot.trade_amount) || 0,
     daily_loss_limit:          Number(bot.daily_max_loss)     || 50,
     take_profit_pct:           Number(bot.take_profit_percent)|| 3.0,
     stop_loss_pct:             Number(bot.stop_loss_percent)  || 2.0,
@@ -961,6 +982,11 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
   });
 
   console.log(`[BOT] Started ${botId} (PID ${child.pid})`);
+  await supabase.from('bots').update({
+    last_process_pid: child.pid || null,
+    last_started_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }).eq('id', botId).eq('user_id', req.user.id);
   res.json({ success: true, pid: child.pid, message: `Bot started (PID ${child.pid})` });
   } catch (err) {
     const message = err?.message || String(err);
@@ -1692,7 +1718,7 @@ app.put('/api/bots/:id', requireUser, async (req, res) => {
   // Build update payload — only include fields that were sent
   const patch = {};
   if (bot_name            !== undefined) patch.bot_name            = bot_name;
-  if (leverage            !== undefined) patch.leverage            = Number(leverage);
+  if (leverage            !== undefined) patch.leverage            = (bot.market_type || 'futures') === 'spot' ? 1 : Number(leverage);
   if (min_confidence      !== undefined) patch.min_confidence      = Number(min_confidence);
   if (stop_loss_percent   !== undefined) patch.stop_loss_percent   = Number(stop_loss_percent);
   if (take_profit_percent !== undefined) patch.take_profit_percent = Number(take_profit_percent);
