@@ -22,6 +22,10 @@ import jwt from 'jsonwebtoken';
 
 dotenv.config();
 
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -43,6 +47,14 @@ const PLAN_CONFIG = {
 };
 
 const PAID_PAYMENT_STATUSES = ['paid'];
+
+function apiErrorMessage(err) {
+  if (!err) return 'Unknown error';
+  if (err.message || err.error_description || err.details || err.hint) {
+    return err.message || err.error_description || err.details || err.hint;
+  }
+  try { return JSON.stringify(err); } catch (_) { return String(err); }
+}
 
 async function getActivePaidSubscription(userId) {
   const { data: sub, error } = await supabase
@@ -83,6 +95,24 @@ async function activatePaidSubscriptionFromCheckout(session) {
     return { activated: false, subscription_id: existingPayment.subscription_id };
   }
 
+  const { data: existingSubscription, error: existingSubErr } = await supabase
+    .from('subscriptions')
+    .select('*')
+    .eq('stripe_checkout_session_id', session.id)
+    .maybeSingle();
+  if (existingSubErr) throw existingSubErr;
+  if (existingSubscription?.payment_status === 'paid') {
+    if (existingPayment) {
+      await supabase.from('subscription_payments').update({
+        subscription_id: existingSubscription.id,
+        status: 'paid',
+        paid_at: new Date().toISOString(),
+        raw_event: session,
+      }).eq('id', existingPayment.id);
+    }
+    return { activated: false, subscription_id: existingSubscription.id };
+  }
+
   const expiresAt = new Date();
   expiresAt.setDate(expiresAt.getDate() + plan.days);
 
@@ -91,7 +121,7 @@ async function activatePaidSubscriptionFromCheckout(session) {
     .eq('user_id', userId)
     .eq('is_active', true);
 
-  const { data: sub, error: subErr } = await supabase.from('subscriptions').insert({
+  const subscriptionPayload = {
     user_id: userId,
     plan_type: planType,
     total_trades: plan.trades,
@@ -110,7 +140,39 @@ async function activatePaidSubscriptionFromCheckout(session) {
       ? session.customer
       : session.customer?.id || null,
     paid_at: new Date().toISOString(),
-  }).select().single();
+  };
+
+  let sub = null;
+  let subErr = null;
+  if (existingSubscription) {
+    ({ data: sub, error: subErr } = await supabase.from('subscriptions')
+      .update({ ...subscriptionPayload, is_active: true })
+      .eq('id', existingSubscription.id)
+      .select()
+      .single());
+  } else {
+    ({ data: sub, error: subErr } = await supabase.from('subscriptions')
+      .insert(subscriptionPayload)
+      .select()
+      .single());
+
+    // Stripe webhooks and the browser return-page verification can arrive at
+    // the same time. If another request inserted this session first, fetch it
+    // and keep the activation idempotent instead of failing the whole request.
+    if (subErr?.code === '23505') {
+      const existing = await supabase.from('subscriptions')
+        .select('*')
+        .eq('stripe_checkout_session_id', session.id)
+        .maybeSingle();
+      if (existing.error) throw existing.error;
+      if (!existing.data) throw subErr;
+      ({ data: sub, error: subErr } = await supabase.from('subscriptions')
+        .update({ ...subscriptionPayload, is_active: true })
+        .eq('id', existing.data.id)
+        .select()
+        .single());
+    }
+  }
   if (subErr) throw subErr;
 
   const amount = (session.amount_total || plan.price * 100) / 100;
@@ -135,18 +197,18 @@ async function activatePaidSubscriptionFromCheckout(session) {
     paid_at: new Date().toISOString(),
   };
 
-  if (existingPayment) {
-    await supabase.from('subscription_payments').update(paymentPayload).eq('id', existingPayment.id);
-  } else {
-    await supabase.from('subscription_payments').insert(paymentPayload);
-  }
+  const paymentResult = existingPayment
+    ? await supabase.from('subscription_payments').update(paymentPayload).eq('id', existingPayment.id)
+    : await supabase.from('subscription_payments')
+        .upsert(paymentPayload, { onConflict: 'stripe_checkout_session_id' });
+  if (paymentResult.error) throw paymentResult.error;
 
-  await supabase.from('revenue_records').insert({
+  const revenueResult = await supabase.from('revenue_records').insert({
     user_id: userId,
+    subscription_id: sub.id,
     amount,
-    plan_type: planType,
-    description: `${planType} plan purchase via Stripe Checkout (${currency})`,
   });
+  if (revenueResult.error) console.warn('[stripe/revenue_records]', revenueResult.error.message);
 
   return { activated: true, subscription_id: sub.id };
 }
@@ -1022,72 +1084,83 @@ app.post('/api/bots/:id/stop', requireUser, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/api/subscriptions/purchase', requireUser, async (req, res) => {
-  const { plan_type } = req.body;
-  const plan = PLAN_CONFIG[plan_type];
-  if (!plan) return res.status(400).json({ error: 'Invalid plan type' });
-  if (!stripe) return res.status(500).json({ error: 'Stripe is not configured on the server.' });
+  try {
+    const { plan_type } = req.body;
+    const plan = PLAN_CONFIG[plan_type];
+    if (!plan) return res.status(400).json({ error: 'Invalid plan type' });
+    if (!stripe) return res.status(500).json({ error: 'Stripe is not configured on the server.' });
 
-  const frontendUrl = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
-  const session = await stripe.checkout.sessions.create({
-    mode: 'payment',
-    client_reference_id: req.user.id,
-    customer_email: req.user.email || undefined,
-    line_items: [{
-      quantity: 1,
-      price_data: {
-        currency: process.env.STRIPE_CURRENCY || 'usd',
-        unit_amount: plan.price * 100,
-        product_data: {
-          name: `NexusBot ${plan.name} Plan`,
-          description: `${plan.trades} trades, ${plan.bots} bot creations, ${plan.days} days access`,
+    const frontendUrl = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      client_reference_id: req.user.id,
+      customer_email: req.user.email || undefined,
+      line_items: [{
+        quantity: 1,
+        price_data: {
+          currency: process.env.STRIPE_CURRENCY || 'usd',
+          unit_amount: plan.price * 100,
+          product_data: {
+            name: `NexusBot ${plan.name} Plan`,
+            description: `${plan.trades} trades, ${plan.bots} bot creations, ${plan.days} days access`,
+          },
         },
+      }],
+      metadata: {
+        user_id: req.user.id,
+        plan_type,
       },
-    }],
-    metadata: {
+      success_url: `${frontendUrl}/subscription?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${frontendUrl}/subscription?payment=cancelled`,
+    });
+
+    const paymentResult = await supabase.from('subscription_payments').upsert({
       user_id: req.user.id,
       plan_type,
-    },
-    success_url: `${frontendUrl}/subscription?payment=success&session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${frontendUrl}/subscription?payment=cancelled`,
-  });
+      amount: plan.price,
+      currency: (process.env.STRIPE_CURRENCY || 'usd').toUpperCase(),
+      status: 'checkout_created',
+      provider: 'stripe',
+      stripe_checkout_session_id: session.id,
+      stripe_customer_id: typeof session.customer === 'string' ? session.customer : null,
+      raw_event: session,
+    }, { onConflict: 'stripe_checkout_session_id' });
+    if (paymentResult.error) throw paymentResult.error;
 
-  await supabase.from('subscription_payments').insert({
-    user_id: req.user.id,
-    plan_type,
-    amount: plan.price,
-    currency: (process.env.STRIPE_CURRENCY || 'usd').toUpperCase(),
-    status: 'checkout_created',
-    provider: 'stripe',
-    stripe_checkout_session_id: session.id,
-    stripe_customer_id: typeof session.customer === 'string' ? session.customer : null,
-    raw_event: session,
-  });
-
-  res.json({
-    success: true,
-    checkout_url: session.url,
-    url: session.url,
-    session_id: session.id,
-  });
+    res.json({
+      success: true,
+      checkout_url: session.url,
+      url: session.url,
+      session_id: session.id,
+    });
+  } catch (err) {
+    console.error('[subscriptions/purchase]', err);
+    res.status(500).json({ error: `Purchase failed: ${apiErrorMessage(err)}` });
+  }
 });
 
 app.post('/api/subscriptions/verify-session', requireUser, async (req, res) => {
-  const { session_id } = req.body;
-  if (!session_id) return res.status(400).json({ error: 'session_id is required' });
-  if (!stripe) return res.status(500).json({ error: 'Stripe is not configured on the server.' });
+  try {
+    const { session_id } = req.body;
+    if (!session_id) return res.status(400).json({ error: 'session_id is required' });
+    if (!stripe) return res.status(500).json({ error: 'Stripe is not configured on the server.' });
 
-  const session = await stripe.checkout.sessions.retrieve(session_id);
-  if (session.client_reference_id !== req.user.id && session.metadata?.user_id !== req.user.id) {
-    return res.status(403).json({ error: 'Checkout session does not belong to this user' });
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    if (session.client_reference_id !== req.user.id && session.metadata?.user_id !== req.user.id) {
+      return res.status(403).json({ error: 'Checkout session does not belong to this user' });
+    }
+
+    if (session.payment_status !== 'paid') {
+      return res.status(402).json({ success: false, status: session.payment_status });
+    }
+
+    await activatePaidSubscriptionFromCheckout(session);
+    const subscription = await getActivePaidSubscription(req.user.id);
+    res.json({ success: true, subscription });
+  } catch (err) {
+    console.error('[subscriptions/verify-session]', err);
+    res.status(500).json({ error: `Payment verification failed: ${apiErrorMessage(err)}` });
   }
-
-  if (session.payment_status !== 'paid') {
-    return res.status(402).json({ success: false, status: session.payment_status });
-  }
-
-  await activatePaidSubscriptionFromCheckout(session);
-  const subscription = await getActivePaidSubscription(req.user.id);
-  res.json({ success: true, subscription });
 });
 
 app.post('/api/subscriptions/cancel', requireUser, async (req, res) => {
