@@ -574,6 +574,81 @@ function isStaleBotRun(req) {
   return Boolean(req.bot?.active_run_id && req.botRunId && req.bot.active_run_id !== req.botRunId);
 }
 
+function normalizeTradeContextSymbol(bot, fallbackSymbol) {
+  const exchangeName = String(bot?.execution_venue || bot?.exchange || '').toLowerCase();
+  if (exchangeName === 'coinbase') return bot?.product_id || fallbackSymbol || bot?.trading_pair;
+  return fallbackSymbol || bot?.trading_pair || bot?.product_id;
+}
+
+async function findRunningBotSymbolConflict(bot, symbol, context = {}) {
+  try {
+    const marketType = String(bot.market_type || 'futures').toLowerCase() === 'spot' ? 'spot' : 'futures';
+    const tradingMode = bot.trading_mode || 'paper';
+    let query = supabase
+      .from('bots')
+      .select('id, trading_pair, product_id')
+      .eq('user_id', bot.user_id)
+      .eq('is_running', true)
+      .eq('market_type', marketType)
+      .eq('trading_mode', tradingMode)
+      .neq('id', bot.id)
+      .limit(25);
+
+    const exchangeId = context.exchangeConnectionId || bot.exchange_id || null;
+    const fingerprint = context.exchangeFingerprint || bot.exchange_account_fingerprint || null;
+    if (exchangeId) query = query.eq('exchange_id', exchangeId);
+    if (fingerprint) query = query.eq('exchange_account_fingerprint', fingerprint);
+
+    const { data, error } = await query;
+    if (error) {
+      console.error('[symbol-lock/running-bots]', error);
+      return null;
+    }
+
+    return (data || []).find((row) => {
+      const rowSymbol = normalizeTradeContextSymbol(row, row.trading_pair);
+      return rowSymbol === symbol || row.trading_pair === symbol || row.product_id === symbol;
+    }) || null;
+  } catch (err) {
+    console.error('[symbol-lock/running-bots]', err);
+    return null;
+  }
+}
+
+async function findOpenTradeSymbolConflict(bot, symbol, context = {}) {
+  try {
+    const marketType = String(bot.market_type || 'futures').toLowerCase() === 'spot' ? 'spot' : 'futures';
+    const isPaper = (bot.trading_mode || 'paper') === 'paper';
+    let query = supabase
+      .from('trades')
+      .select('id, bot_id, trading_pair, product_id, trade_type, opened_at')
+      .eq('user_id', bot.user_id)
+      .eq('status', 'open')
+      .eq('market_type', marketType)
+      .eq('is_paper', isPaper)
+      .neq('bot_id', bot.id)
+      .limit(25);
+
+    const exchangeConnectionId = context.exchangeConnectionId || bot.exchange_id || null;
+    const exchangeName = context.exchangeName || bot.execution_venue || bot.exchange || 'binance';
+    const fingerprint = context.exchangeFingerprint || bot.exchange_account_fingerprint || null;
+    if (exchangeConnectionId) query = query.eq('exchange_connection_id', exchangeConnectionId);
+    else query = query.eq('exchange_name', exchangeName);
+    if (fingerprint) query = query.eq('exchange_account_fingerprint', fingerprint);
+
+    const { data, error } = await query;
+    if (error) {
+      console.error('[symbol-lock/open-trades]', error);
+      return null;
+    }
+
+    return (data || []).find((row) => row.trading_pair === symbol || row.product_id === symbol) || null;
+  } catch (err) {
+    console.error('[symbol-lock/open-trades]', err);
+    return null;
+  }
+}
+
 async function requireUser(req, res, next) {
   const auth = req.headers['authorization'] || '';
   const jwt  = auth.startsWith('Bearer ') ? auth.slice(7) : '';
@@ -621,6 +696,41 @@ app.post('/api/bot/heartbeat', requireBotToken, async (req, res) => {
   res.json({ success: true, commands });
 });
 
+app.post('/api/bot/trade/check-open', requireBotToken, async (req, res) => {
+  if (isStaleBotRun(req)) return res.status(409).json({ success: false, blocked: true, reason: 'stale_bot_run', error: 'Stale bot run' });
+  const bot = req.bot;
+  const { symbol } = req.body || {};
+  const requestedSymbol = symbol || bot.product_id || bot.trading_pair;
+  let exchangeName = 'binance';
+  let exchangeConnectionId = bot.exchange_id || null;
+  let exchangeFingerprint = bot.exchange_account_fingerprint || null;
+  if (bot.exchange_id) {
+    const { data: ex } = await supabase.from('exchange_connections')
+      .select('exchange_name, account_fingerprint').eq('id', bot.exchange_id).maybeSingle();
+    exchangeName = ex?.exchange_name || 'binance';
+    exchangeFingerprint = exchangeFingerprint || ex?.account_fingerprint || null;
+  }
+
+  const lockSymbol = bot.product_id || requestedSymbol;
+  const conflict = await findOpenTradeSymbolConflict(bot, lockSymbol, {
+    exchangeName,
+    exchangeConnectionId,
+    exchangeFingerprint,
+  });
+  if (conflict) {
+    return res.status(409).json({
+      success: false,
+      blocked: true,
+      reason: 'symbol_position_lock',
+      error: `${lockSymbol} already has an open trade for this exchange/account context.`,
+      conflict_trade_id: conflict.id,
+      conflict_bot_id: conflict.bot_id,
+    });
+  }
+
+  res.json({ success: true, allowed: true });
+});
+
 app.post('/api/bot/trade/open', requireBotToken, async (req, res) => {
   if (isStaleBotRun(req)) return res.status(409).json({ success: false, error: 'Stale bot run' });
   const bot = req.bot;
@@ -634,6 +744,23 @@ app.post('/api/bot/trade/open', requireBotToken, async (req, res) => {
       .select('exchange_name, account_fingerprint').eq('id', bot.exchange_id).maybeSingle();
     exchangeName = ex?.exchange_name || 'binance';
     exchangeFingerprint = exchangeFingerprint || ex?.account_fingerprint || null;
+  }
+
+  const lockSymbol = bot.product_id || symbol;
+  const conflict = await findOpenTradeSymbolConflict(bot, lockSymbol, {
+    exchangeName,
+    exchangeConnectionId,
+    exchangeFingerprint,
+  });
+  if (conflict) {
+    return res.status(409).json({
+      success: false,
+      blocked: true,
+      reason: 'symbol_position_lock',
+      error: `${lockSymbol} already has an open trade for this exchange/account context.`,
+      conflict_trade_id: conflict.id,
+      conflict_bot_id: conflict.bot_id,
+    });
   }
 
   const tradePayload = {
@@ -1029,6 +1156,33 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
   if (exchangeName === 'coinbase' && (bot.trading_mode || 'paper') === 'live') {
     return res.status(422).json({
       error: 'Coinbase live bot execution is not enabled yet. Phase 2 supports Coinbase market-data-backed paper trading only.',
+    });
+  }
+
+  const lockSymbol = exchangeName === 'coinbase' ? (bot.product_id || bot.trading_pair) : bot.trading_pair;
+  const runningConflict = await findRunningBotSymbolConflict(bot, lockSymbol, {
+    exchangeConnectionId: bot.exchange_id || null,
+    exchangeFingerprint,
+  });
+  if (runningConflict) {
+    return res.status(409).json({
+      error: `${lockSymbol} already has a running bot for this exchange/account context. Stop that bot before starting another bot on the same pair.`,
+      conflict_bot_id: runningConflict.id,
+      reason: 'symbol_running_bot_lock',
+    });
+  }
+
+  const openTradeConflict = await findOpenTradeSymbolConflict(bot, lockSymbol, {
+    exchangeName,
+    exchangeConnectionId: bot.exchange_id || null,
+    exchangeFingerprint,
+  });
+  if (openTradeConflict) {
+    return res.status(409).json({
+      error: `${lockSymbol} already has an open trade for this exchange/account context. Close or reconcile the existing trade before starting another bot on the same pair.`,
+      conflict_trade_id: openTradeConflict.id,
+      conflict_bot_id: openTradeConflict.bot_id,
+      reason: 'symbol_position_lock',
     });
   }
 
