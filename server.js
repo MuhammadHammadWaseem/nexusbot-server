@@ -636,17 +636,31 @@ app.post('/api/bot/trade/open', requireBotToken, async (req, res) => {
     exchangeFingerprint = exchangeFingerprint || ex?.account_fingerprint || null;
   }
 
-  const { data: trade, error } = await supabase.from('trades').insert({
+  const tradePayload = {
     bot_id: bot.id, user_id: bot.user_id, exchange_name: exchangeName,
     exchange_connection_id: exchangeConnectionId,
     exchange_account_fingerprint: exchangeFingerprint,
     market_type: bot.market_type || 'futures',
+    execution_venue: bot.execution_venue || exchangeName,
+    product_id: bot.product_id || symbol,
+    model_exchange: bot.model_exchange || exchangeName || 'binance',
+    model_market_type: bot.model_market_type || bot.market_type || 'futures',
     trading_pair: symbol, trade_type: side === 'long' ? 'long' : 'short',
     entry_price, quantity, leverage: leverage || 5, tp_price, sl_price,
     confidence, signal_type, regime, order_id, status: 'open',
     is_paper: (bot.trading_mode === 'paper'),  // correctly flags paper trades
     opened_at: opened_at || new Date().toISOString(),
-  }).select('id').single();
+  };
+
+  let { data: trade, error } = await supabase.from('trades').insert(tradePayload).select('id').single();
+  if (error && /execution_venue|product_id|model_exchange|model_market_type/i.test(error.message || '')) {
+    const legacyPayload = { ...tradePayload };
+    delete legacyPayload.execution_venue;
+    delete legacyPayload.product_id;
+    delete legacyPayload.model_exchange;
+    delete legacyPayload.model_market_type;
+    ({ data: trade, error } = await supabase.from('trades').insert(legacyPayload).select('id').single());
+  }
 
   if (error) { console.error('[trade/open]', error); return res.status(500).json({ success: false, error: error.message }); }
   await supabase.rpc('decrement_remaining_trades', { p_user_id: bot.user_id });
@@ -790,6 +804,109 @@ app.get('/api/bots/:id/logs', requireUser, async (req, res) => {
   res.json({ logs: (data || []).reverse() });
 });
 
+const MARKET_INTERVALS = {
+  '1m': { binance: '1m', coinbase: 'ONE_MINUTE', seconds: 60 },
+  '5m': { binance: '5m', coinbase: 'FIVE_MINUTE', seconds: 300 },
+  '15m': { binance: '15m', coinbase: 'FIFTEEN_MINUTE', seconds: 900 },
+  '30m': { binance: '30m', coinbase: 'THIRTY_MINUTE', seconds: 1800 },
+  '1h': { binance: '1h', coinbase: 'ONE_HOUR', seconds: 3600 },
+  '2h': { binance: '2h', coinbase: 'TWO_HOUR', seconds: 7200 },
+  '6h': { binance: '6h', coinbase: 'SIX_HOUR', seconds: 21600 },
+  '1d': { binance: '1d', coinbase: 'ONE_DAY', seconds: 86400 },
+};
+
+function normalizeBinanceMarketSymbol(symbol) {
+  return String(symbol || '')
+    .replace('/', '')
+    .replace(':USDT', '')
+    .replace(':BTC', '')
+    .toUpperCase();
+}
+
+function normalizeCoinbaseMarketProduct(symbol) {
+  const value = String(symbol || '').trim().toUpperCase();
+  if (value.includes('-')) return value;
+  if (value.includes('/')) {
+    const [base, quote] = value.split('/');
+    return `${base}-${quote}`;
+  }
+  if (value.endsWith('USDT')) return `${value.slice(0, -4)}-USDT`;
+  if (value.endsWith('USD')) return `${value.slice(0, -3)}-USD`;
+  return value;
+}
+
+async function fetchBinanceCandles({ symbol, interval, limit, marketType }) {
+  const sym = normalizeBinanceMarketSymbol(symbol);
+  const base = marketType === 'spot' ? 'https://api.binance.com' : 'https://fapi.binance.com';
+  const path = marketType === 'spot' ? '/api/v3/klines' : '/fapi/v1/klines';
+  const url = `${base}${path}?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&limit=${limit}`;
+  const response = await fetch(url, { headers: { 'Cache-Control': 'no-cache' }, signal: AbortSignal.timeout(10_000) });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.msg || data?.message || `Binance klines HTTP ${response.status}`);
+  }
+  return data.map((k) => ({
+    time: Number(k[0]),
+    open: Number(k[1]),
+    high: Number(k[2]),
+    low: Number(k[3]),
+    close: Number(k[4]),
+  })).filter((c) => Number.isFinite(c.time) && Number.isFinite(c.close));
+}
+
+async function fetchCoinbaseCandles({ symbol, interval, limit }) {
+  const spec = MARKET_INTERVALS[interval] || MARKET_INTERVALS['1m'];
+  const productId = normalizeCoinbaseMarketProduct(symbol);
+  const end = Math.floor(Date.now() / 1000);
+  const start = end - (limit * spec.seconds);
+  const url = new URL(`https://api.coinbase.com/api/v3/brokerage/market/products/${encodeURIComponent(productId)}/candles`);
+  url.searchParams.set('start', String(start));
+  url.searchParams.set('end', String(end));
+  url.searchParams.set('granularity', spec.coinbase);
+
+  const response = await fetch(url, { headers: { 'Cache-Control': 'no-cache' }, signal: AbortSignal.timeout(15_000) });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.message || data?.error || `Coinbase candles HTTP ${response.status}`);
+  }
+  const candles = Array.isArray(data?.candles) ? data.candles : [];
+  return candles.map((c) => ({
+    time: Number(c.start || c.timestamp || 0) * 1000,
+    open: Number(c.open),
+    high: Number(c.high),
+    low: Number(c.low),
+    close: Number(c.close),
+  }))
+    .filter((c) => Number.isFinite(c.time) && Number.isFinite(c.close))
+    .sort((a, b) => a.time - b.time)
+    .slice(-limit);
+}
+
+app.get('/api/market/candles', requireUser, async (req, res) => {
+  const exchange = normalizeExchangeName(req.query.exchange || 'binance');
+  const marketType = String(req.query.market_type || 'futures').toLowerCase() === 'spot' ? 'spot' : 'futures';
+  const symbol = String(req.query.symbol || '').trim();
+  const interval = MARKET_INTERVALS[String(req.query.interval || '1m')] ? String(req.query.interval || '1m') : '1m';
+  const limit = Math.max(2, Math.min(Number(req.query.limit) || 120, 300));
+
+  if (!symbol) return res.status(400).json({ error: 'symbol is required' });
+
+  try {
+    const candles = exchange === 'coinbase'
+      ? await fetchCoinbaseCandles({ symbol, interval, limit })
+      : await fetchBinanceCandles({ symbol, interval, limit, marketType });
+
+    res.json({ exchange, market_type: marketType, symbol, interval, candles });
+  } catch (e) {
+    res.status(502).json({
+      error: 'Could not fetch market candles.',
+      message: e?.message || String(e),
+      exchange,
+      symbol,
+    });
+  }
+});
+
 app.get('/api/market/analysis/:symbol', requireUser, async (req, res) => {
   // Accept both BTCUSDT and BTC/USDT
   const symbol = req.params.symbol.toUpperCase().replace('/', '');
@@ -909,6 +1026,11 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
       });
     }
   }
+  if (exchangeName === 'coinbase' && (bot.trading_mode || 'paper') === 'live') {
+    return res.status(422).json({
+      error: 'Coinbase live bot execution is not enabled yet. Phase 2 supports Coinbase market-data-backed paper trading only.',
+    });
+  }
 
   const botToken = bot.bot_token || crypto.randomBytes(32).toString('hex');
   const botRunId = crypto.randomBytes(16).toString('hex');
@@ -947,9 +1069,14 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
     // In .env: BOT_API_URL=http://127.0.0.1:3001  (loopback, fastest path)
     laravel_api_url: `${process.env.BOT_API_URL || 'http://127.0.0.1:3001'}/api/bot`,
     // Trading params
-    symbol:     bot.trading_pair,
+    symbol:     exchangeName === 'coinbase' ? (bot.product_id || bot.trading_pair) : bot.trading_pair,
     timeframe:  bot.timeframe,
     market_type: marketType,
+    execution_venue: exchangeName,
+    product_id: bot.product_id || bot.trading_pair,
+    model_exchange: bot.model_exchange || exchangeName || 'binance',
+    model_market_type: bot.model_market_type || marketType,
+    model_symbol: bot.model_symbol || bot.trading_pair,
     leverage:   marketType === 'spot' ? 1 : (bot.leverage || 5),
     // Exchange credentials
     api_key:      apiKey,
@@ -1319,6 +1446,48 @@ async function coinbaseRequest(conn, method, requestPath, body = null) {
   throw lastErr || new Error('Coinbase request failed');
 }
 
+async function coinbasePublicRequest(requestPath, params = {}) {
+  const url = new URL(`https://api.coinbase.com${requestPath}`);
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') url.searchParams.set(key, String(value));
+  });
+  const response = await fetch(url, {
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
+    signal: AbortSignal.timeout(10_000),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.message || data?.error || `Coinbase HTTP ${response.status}`);
+  }
+  return data;
+}
+
+function normalizeCoinbaseProduct(product) {
+  const productId = String(product?.product_id || '').toUpperCase();
+  const productType = String(product?.product_type || '').toUpperCase();
+  const isFuture = productType.includes('FUTURE') || productType === 'FUTURE';
+  return {
+    product_id: productId,
+    symbol: productId,
+    exchange: 'coinbase',
+    market_type: isFuture ? 'futures' : 'spot',
+    product_type: productType,
+    base_asset: product?.base_currency_id || product?.base_name || '',
+    quote_asset: product?.quote_currency_id || '',
+    status: product?.status || product?.trading_disabled ? 'disabled' : 'online',
+    trading_disabled: Boolean(product?.trading_disabled),
+    cancel_only: Boolean(product?.cancel_only),
+    limit_only: Boolean(product?.limit_only),
+    post_only: Boolean(product?.post_only),
+    min_quantity: Number(product?.base_min_size || product?.min_size || 0),
+    quantity_step: Number(product?.base_increment || 0),
+    price_tick: Number(product?.quote_increment || product?.price_increment || 0),
+    min_notional: Number(product?.quote_min_size || product?.min_market_funds || 0),
+    max_leverage: Number(product?.max_leverage || 1),
+    raw: product,
+  };
+}
+
 async function getCoinbaseUsdPrice(asset) {
   const symbol = String(asset || '').toUpperCase();
   if (['USD', 'USDC', 'USDT'].includes(symbol)) return 1;
@@ -1440,6 +1609,71 @@ app.put('/api/exchange/active', requireUser, async (req, res) => {
       ? `${result.disabled_bot_count} bot(s) require reconfiguration because they belong to another exchange/account.`
       : 'Active exchange updated.',
   });
+});
+
+app.get('/api/exchange/products', requireUser, async (req, res) => {
+  const exchangeName = normalizeExchangeName(req.query.exchange || 'binance');
+  const marketType = String(req.query.market_type || 'futures').toLowerCase() === 'spot' ? 'spot' : 'futures';
+
+  if (exchangeName !== 'coinbase') {
+    return res.status(400).json({ error: 'Product discovery endpoint currently supports Coinbase only.' });
+  }
+
+  try {
+    const productType = marketType === 'futures' ? 'FUTURE' : 'SPOT';
+    let products = [];
+    try {
+      const publicData = await coinbasePublicRequest('/api/v3/brokerage/market/products', {
+        product_type: productType,
+      });
+      products = Array.isArray(publicData?.products) ? publicData.products : [];
+    } catch (publicErr) {
+      const { connection } = await getActiveExchangeContext(req.user.id);
+      if (!connection || normalizeExchangeName(connection.exchange_name) !== 'coinbase') throw publicErr;
+      const authData = await coinbaseRequest(connection, 'GET', `/api/v3/brokerage/products?product_type=${encodeURIComponent(productType)}`);
+      products = Array.isArray(authData?.products) ? authData.products : [];
+    }
+
+    const normalized = products
+      .map(normalizeCoinbaseProduct)
+      .filter((p) => p.market_type === marketType && p.product_id);
+
+    if (normalized.length) {
+      const cacheRows = normalized.map((p) => ({
+        exchange_name: 'coinbase',
+        market_type: marketType,
+        product_id: p.product_id,
+        base_asset: p.base_asset || null,
+        quote_asset: p.quote_asset || null,
+        status: p.status || null,
+        trading_disabled: !!p.trading_disabled,
+        min_quantity: Number.isFinite(p.min_quantity) ? p.min_quantity : null,
+        min_notional: Number.isFinite(p.min_notional) ? p.min_notional : null,
+        quantity_step: Number.isFinite(p.quantity_step) ? p.quantity_step : null,
+        price_tick: Number.isFinite(p.price_tick) ? p.price_tick : null,
+        max_leverage: Number.isFinite(p.max_leverage) ? p.max_leverage : null,
+        raw: p.raw || {},
+        fetched_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }));
+      const { error: cacheErr } = await supabase
+        .from('exchange_products')
+        .upsert(cacheRows, { onConflict: 'exchange_name,market_type,product_id' });
+      if (cacheErr) console.warn('[exchange/products] cache skipped:', cacheErr.message);
+    }
+
+    res.json({
+      exchange: 'coinbase',
+      market_type: marketType,
+      count: normalized.length,
+      products: normalized,
+    });
+  } catch (e) {
+    res.status(502).json({
+      error: 'Could not fetch Coinbase products.',
+      message: e?.message || String(e),
+    });
+  }
 });
 
 app.post('/api/exchange/test', requireUser, async (req, res) => {
