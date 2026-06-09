@@ -236,6 +236,50 @@ function clearUserBalanceCache(userId) {
   }
 }
 
+// Binance rejects signed requests when the client timestamp is even slightly
+// ahead of Binance server time. Cache a short-lived offset and bias timestamps
+// behind the exchange clock so dashboard balance checks do not fail when the
+// VPS/local machine clock drifts or network latency is uneven.
+let _binanceTimeOffsetMs = 0;
+let _binanceTimeOffsetExpiresAt = 0;
+
+async function getBinanceTimeOffsetMs(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && _binanceTimeOffsetExpiresAt > now) return _binanceTimeOffsetMs;
+
+  const endpoints = [
+    'https://fapi.binance.com/fapi/v1/time',
+    'https://api.binance.com/api/v3/time',
+  ];
+
+  for (const endpoint of endpoints) {
+    try {
+      const response = await fetch(endpoint, { signal: AbortSignal.timeout(5000) });
+      const receivedAt = Date.now();
+      const data = await response.json().catch(() => ({}));
+      const serverTime = Number(data?.serverTime || 0);
+      if (response.ok && Number.isFinite(serverTime) && serverTime > 0) {
+        // Use the receive time, not request midpoint, so the signed timestamp
+        // is never accidentally ahead of Binance when the request is slow.
+        _binanceTimeOffsetMs = serverTime - receivedAt;
+        _binanceTimeOffsetExpiresAt = Date.now() + 30_000;
+        return _binanceTimeOffsetMs;
+      }
+    } catch (err) {
+      logFetchError('/binance/time', err);
+    }
+  }
+
+  _binanceTimeOffsetMs = 0;
+  _binanceTimeOffsetExpiresAt = Date.now() + 2_000;
+  return _binanceTimeOffsetMs;
+}
+
+async function getBinanceSignedTimestamp(forceRefresh = false) {
+  const offset = await getBinanceTimeOffsetMs(forceRefresh);
+  return Date.now() + offset - 2500;
+}
+
 function normalizeExchangeName(name) {
   const value = String(name || 'binance').toLowerCase().trim();
   return value === 'coinbase' ? 'coinbase' : 'binance';
@@ -1892,9 +1936,9 @@ app.post('/api/exchange/test', requireUser, async (req, res) => {
 
     const nextFingerprint = buildExchangeAccountFingerprint('binance', apiKey);
     const previousFingerprint = conn.account_fingerprint || null;
-    const ts    = Date.now();
+    const ts    = await getBinanceSignedTimestamp();
     // recvWindow=10000 gives a 10s tolerance for clock skew between server and Binance
-    const query = `timestamp=${ts}&recvWindow=10000`;
+    const query = `timestamp=${ts}&recvWindow=60000`;
     const sig   = crypto.createHmac('sha256', apiSecret).update(query).digest('hex');
     const url   = `https://fapi.binance.com/fapi/v2/balance?${query}&signature=${sig}`;
     const response = await fetch(url, {
@@ -2243,6 +2287,9 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
     }
   }
 
+  const cachedBalance = getCachedBalance(req.user.id, conn);
+  if (cachedBalance) return res.json(cachedBalance);
+
   try {
     const apiKey = (conn.api_key || '').trim();
     const apiSecret = (conn.api_secret || '').trim();
@@ -2275,8 +2322,8 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
       return price;
     };
 
-    const ts    = Date.now();
-    const query = `timestamp=${ts}&recvWindow=10000`;
+    const ts    = await getBinanceSignedTimestamp();
+    const query = `timestamp=${ts}&recvWindow=60000`;
     const sig   = sign(query);
     const url   = `https://fapi.binance.com/fapi/v2/balance?${query}&signature=${sig}`;
     sourcesChecked.push('futures');
@@ -2350,8 +2397,8 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
     let spotAvailable = 0;
     sourcesChecked.push('spot');
     try {
-      const spotTs = Date.now();
-      const spotQuery = `timestamp=${spotTs}&recvWindow=10000`;
+      const spotTs = await getBinanceSignedTimestamp();
+      const spotQuery = `timestamp=${spotTs}&recvWindow=60000`;
       const spotSig = sign(spotQuery);
       const spotResponse = await fetch(`https://api.binance.com/api/v3/account?${spotQuery}&signature=${spotSig}`, {
         headers: { 'X-MBX-APIKEY': apiKey },
@@ -2375,12 +2422,12 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
     let fundingAvailable = 0;
     sourcesChecked.push('funding');
     try {
-      const fundingTs = Date.now();
+      const fundingTs = await getBinanceSignedTimestamp();
       const fundingParams = new URLSearchParams({
         asset: 'USDT',
         needBtcValuation: 'false',
         timestamp: String(fundingTs),
-        recvWindow: '10000',
+        recvWindow: '60000',
       });
       const fundingQuery = fundingParams.toString();
       fundingParams.set('signature', sign(fundingQuery));
@@ -2437,6 +2484,7 @@ app.get('/api/user/balance', requireUser, async (req, res) => {
       api_key_preview:           keyPreview,
     };
 
+    setCachedBalance(req.user.id, conn, result);
     res.json(result);
   } catch (e) {
     logFetchError('/api/user/balance', e);   // suppresses repeated spam
@@ -2481,8 +2529,8 @@ async function syncTradesForUser(userId, apiKey, apiSecret, exchangeConnectionId
   }
 
   // 2. Fetch all open positions from exchange (one call, all symbols)
-  const ts    = Date.now();
-  const query = `timestamp=${ts}&recvWindow=10000`;
+  const ts    = await getBinanceSignedTimestamp();
+  const query = `timestamp=${ts}&recvWindow=60000`;
   const sig   = crypto.createHmac('sha256', (apiSecret || '').trim()).update(query).digest('hex');
   const url   = `https://fapi.binance.com/fapi/v2/positionRisk?${query}&signature=${sig}`;
 
@@ -2669,8 +2717,8 @@ app.post('/api/exchange/validate', requireUser, async (req, res) => {
   // If it fails with a geo error, we skip validation and save the keys anyway —
   // the bot will discover bad keys immediately when it starts.
   try {
-    const ts    = Date.now();
-    const query = `timestamp=${ts}&recvWindow=10000`;
+    const ts    = await getBinanceSignedTimestamp();
+    const query = `timestamp=${ts}&recvWindow=60000`;
     const sig   = crypto.createHmac('sha256', secret).update(query).digest('hex');
     const url   = `https://fapi.binance.com/fapi/v2/balance?${query}&signature=${sig}`;
 
