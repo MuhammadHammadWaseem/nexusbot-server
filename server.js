@@ -1232,7 +1232,7 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
 
   const botToken = bot.bot_token || crypto.randomBytes(32).toString('hex');
   const botRunId = crypto.randomBytes(16).toString('hex');
-  await supabase.from('bots').update({
+  const { data: claimedBot, error: claimErr } = await supabase.from('bots').update({
     bot_token: botToken,
     active_run_id: botRunId,
     is_running: true,
@@ -1241,7 +1241,18 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
     disabled_reason: null,
     exchange_account_fingerprint: exchangeFingerprint || bot.exchange_account_fingerprint || null,
     updated_at: new Date().toISOString(),
-  }).eq('id', botId);
+  }).eq('id', botId)
+    .eq('user_id', req.user.id)
+    .eq('is_running', false)
+    .select('id')
+    .maybeSingle();
+
+  if (claimErr) {
+    throw claimErr;
+  }
+  if (!claimedBot) {
+    return res.json({ success: true, message: 'Already running' });
+  }
 
   const configDir  = process.env.BOT_CONFIG_DIR || path.join(__dirname, '../AITradingBot/bot_configs');
   fs.mkdirSync(configDir, { recursive: true });
