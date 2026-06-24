@@ -871,6 +871,43 @@ app.post('/api/bot/signal', requireBotToken, async (req, res) => {
   res.json({ success: true });
 });
 
+app.post('/api/bot/signal-audit', requireBotToken, async (req, res) => {
+  if (isStaleBotRun(req)) return res.json({ success: true, ignored: true, reason: 'stale_bot_run' });
+  const body = req.body || {};
+  const payload = {
+    audit_id: body.audit_id || undefined,
+    bot_id: req.bot.id,
+    user_id: req.bot.user_id,
+    exchange_name: req.bot.execution_venue || req.bot.exchange_name || 'binance',
+    exchange_connection_id: req.bot.exchange_id || null,
+    exchange_account_fingerprint: req.bot.exchange_account_fingerprint || null,
+    symbol: body.symbol || req.bot.trading_pair || req.bot.product_id,
+    market_type: body.market_type || req.bot.market_type || 'futures',
+    side: body.side || null,
+    entry_price: body.entry_price ?? null,
+    confidence: body.confidence ?? null,
+    regime: body.regime || null,
+    adx: body.adx ?? null,
+    atr_ratio: body.atr_ratio ?? null,
+    tech_signal: body.tech_signal || null,
+    ml_signal: body.ml_signal || null,
+    hybrid_signal: body.hybrid_signal || null,
+    blocked_reason: body.blocked_reason || 'UNKNOWN',
+    evaluated_at: body.timestamp || new Date().toISOString(),
+  };
+
+  const { error } = await supabase.from('signal_audits').insert(payload);
+  if (error) {
+    console.error('[signal-audit]', error.message || error);
+    return res.status(200).json({
+      success: false,
+      warning: 'signal_audit_not_persisted',
+      error: error.message,
+    });
+  }
+  res.json({ success: true });
+});
+
 app.post('/api/bot/log/batch', requireBotToken, async (req, res) => {
   if (isStaleBotRun(req)) return res.json({ success: true, ignored: true, reason: 'stale_bot_run' });
   const entries = req.body?.entries;
@@ -1320,6 +1357,25 @@ app.post('/api/bots/:id/start', requireUser, async (req, res) => {
   }
   if (path.isAbsolute(pythonExe) && !fs.existsSync(pythonExe)) {
     throw new Error(`PYTHON_EXE not found: ${pythonExe}`);
+  }
+
+  const botProjectRoot = path.resolve(path.dirname(botScript), '..');
+  const modelSymbol = String(
+    bot.model_symbol || (exchangeName === 'coinbase' ? (bot.product_id || bot.trading_pair) : bot.trading_pair)
+  ).replace(/\//g, '');
+  const modelCandidates = exchangeName === 'binance'
+    ? (marketType === 'spot'
+        ? [path.join(botProjectRoot, 'saved_models', 'spot', `ml_${modelSymbol}.joblib`)]
+        : [
+            path.join(botProjectRoot, 'saved_models', 'futures', `ml_${modelSymbol}.joblib`),
+            path.join(botProjectRoot, 'saved_models', `ml_${modelSymbol}.joblib`),
+          ])
+    : [path.join(botProjectRoot, 'saved_models', exchangeName, marketType, `ml_${modelSymbol}.joblib`)];
+  if (!modelCandidates.some(candidate => fs.existsSync(candidate))) {
+    throw new Error(
+      `${exchangeName.toUpperCase()} ${marketType} model not deployed for ${modelSymbol}. ` +
+      `Expected: ${modelCandidates.join(' or ')}`
+    );
   }
 
   const stdioLogDir = process.env.BOT_STDIO_LOG_DIR || path.join(configDir, 'process_logs');
@@ -2118,8 +2174,9 @@ app.post('/api/admin/subscriptions/grant', requireUser, requireAdmin, async (req
 
 // ══════════════════════════════════════════════════════════════════════════════
 // OPEN TRADE UNREALISED PNL
-// Reads the most recent [WATCHING] log for each open trade to extract live PnL.
-// The Python bot logs "[WATCHING] SYMBOL ... PnL=+0.1234 ..." every cycle.
+// Reads the most recent position monitor log for each open trade to extract live PnL.
+// Futures logs "[WATCHING] SYMBOL ... PnL=+0.1234 ..."; spot logs
+// "[SPOT WATCH] SYMBOL ... PnL=+0.1234 ...".
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/user/open-pnl', requireUser, async (req, res) => {
@@ -2137,22 +2194,30 @@ app.get('/api/user/open-pnl', requireUser, async (req, res) => {
     return res.json({ trades: [] });
   }
 
-  // 2. For each open trade, find most recent WATCHING log from that bot
+  // 2. For each open trade, find most recent WATCHING/SPOT WATCH log from that bot.
   const enriched = await Promise.all(openTrades.map(async (trade) => {
     const { data: logs } = await supabase
       .from('bot_logs')
       .select('message, logged_at')
       .eq('bot_id', trade.bot_id)
-      .ilike('message', `%[WATCHING] ${trade.trading_pair}%`)
+      .ilike('message', `%${trade.trading_pair}%`)
       .order('logged_at', { ascending: false })
-      .limit(1);
+      .limit(25);
 
     let unrealized_pnl = 0;
     let current_price  = null;
     let pnl_r          = null;
 
-    if (logs && logs.length > 0) {
-      const msg = logs[0].message;
+    const watchLog = (logs || []).find((row) => {
+      const msg = row?.message || '';
+      return (
+        msg.includes(`[WATCHING] ${trade.trading_pair}`) ||
+        msg.includes(`[SPOT WATCH] ${trade.trading_pair}`)
+      );
+    });
+
+    if (watchLog) {
+      const msg = watchLog.message;
       // Parse: PnL=+0.1234
       const pnlMatch = msg.match(/PnL=([+-]?\d+\.\d+)/);
       if (pnlMatch) unrealized_pnl = parseFloat(pnlMatch[1]);
