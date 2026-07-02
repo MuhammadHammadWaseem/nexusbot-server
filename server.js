@@ -2131,12 +2131,14 @@ app.post('/api/admin/users/unban', requireUser, requireAdmin, async (req, res) =
 });
 
 app.get('/api/admin/metrics', requireUser, requireAdmin, async (req, res) => {
-  const [{ count: totalUsers }, { data: subs }, { count: totalBots }, { count: activeBots }, { count: totalTrades }, { data: revenue }] = await Promise.all([
+  const today = new Date().toISOString().split('T')[0];
+  const [{ count: totalUsers }, { data: subs }, { count: totalBots }, { count: activeBots }, { count: totalTrades }, { count: todayTrades }, { data: revenue }] = await Promise.all([
     supabase.from('user_profiles').select('*', { count: 'exact', head: true }),
     supabase.from('subscriptions').select('plan_type').eq('is_active', true),
     supabase.from('bots').select('*', { count: 'exact', head: true }),
     supabase.from('bots').select('*', { count: 'exact', head: true }).eq('is_running', true),
     supabase.from('trades').select('*', { count: 'exact', head: true }),
+    supabase.from('trades').select('*', { count: 'exact', head: true }).gte('created_at', today),
     supabase.from('revenue_records').select('amount'),
   ]);
   const planPrices = { starter: 29, pro: 79, elite: 149 };
@@ -2145,7 +2147,54 @@ app.get('/api/admin/metrics', requireUser, requireAdmin, async (req, res) => {
     totalRevenue: (revenue || []).reduce((s, r) => s + Number(r.amount), 0),
     mrr: (subs || []).reduce((s, sub) => s + (planPrices[sub.plan_type] || 0), 0),
     totalBots: totalBots || 0, activeBots: activeBots || 0, totalTrades: totalTrades || 0,
+    todayTrades: todayTrades || 0,
   });
+});
+
+app.get('/api/admin/bots', requireUser, requireAdmin, async (req, res) => {
+  const { data: bots } = await supabase.from('bots').select('*').order('created_at', { ascending: false });
+  const { data: { users: authUsers } } = await supabase.auth.admin.listUsers();
+  const emailMap = new Map((authUsers || []).map(u => [u.id, u.email]));
+  const result = (bots || []).map(b => ({ ...b, user_email: emailMap.get(b.user_id) || '' }));
+  res.json({ bots: result });
+});
+
+app.post('/api/admin/bots/:id/stop', requireUser, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  await supabase.from('bots').update({ is_running: false }).eq('id', id);
+  await supabase.from('audit_logs').insert({ admin_id: req.user.id, action: 'bot_stopped', resource_type: 'bot', resource_id: id });
+  res.json({ success: true });
+});
+
+app.get('/api/admin/trades', requireUser, requireAdmin, async (req, res) => {
+  const [{ data: trades }, { data: bots }, { data: { users: authUsers } }] = await Promise.all([
+    supabase.from('trades').select('*').order('created_at', { ascending: false }).limit(500),
+    supabase.from('bots').select('id, bot_name'),
+    supabase.auth.admin.listUsers(),
+  ]);
+  const emailMap = new Map((authUsers || []).map(u => [u.id, u.email]));
+  const botMap   = new Map((bots   || []).map(b => [b.id, b.bot_name]));
+  const result = (trades || []).map(t => ({
+    ...t,
+    user_email: emailMap.get(t.user_id) || '',
+    bot_name:   botMap.get(t.bot_id)    || '',
+  }));
+  res.json({ trades: result });
+});
+
+app.get('/api/admin/subscriptions', requireUser, requireAdmin, async (req, res) => {
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString();
+  const [{ data: subs }, { data: revenue }, { data: { users: authUsers } }] = await Promise.all([
+    supabase.from('subscriptions').select('*').order('created_at', { ascending: false }),
+    supabase.from('revenue_records').select('amount, created_at'),
+    supabase.auth.admin.listUsers(),
+  ]);
+  const emailMap = new Map((authUsers || []).map(u => [u.id, u.email]));
+  const subscriptions  = (subs || []).map(s => ({ ...s, user_email: emailMap.get(s.user_id) || '' }));
+  const totalRevenue   = (revenue || []).reduce((sum, r) => sum + Number(r.amount), 0);
+  const monthlyRevenue = (revenue || []).filter(r => r.created_at > thirtyDaysAgo).reduce((sum, r) => sum + Number(r.amount), 0);
+  const activeCount    = subscriptions.filter(s => s.is_active && new Date(s.expires_at) > new Date()).length;
+  res.json({ subscriptions, totalRevenue, monthlyRevenue, activeCount });
 });
 
 app.post('/api/admin/subscriptions/grant', requireUser, requireAdmin, async (req, res) => {
