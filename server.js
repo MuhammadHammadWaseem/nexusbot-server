@@ -540,7 +540,7 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
+  allowedHeaders: ['Content-Type','Authorization','ngrok-skip-browser-warning'],
 }));
 
 // Handle OPTIONS preflight for all routes
